@@ -1,0 +1,10 @@
+-----BEGIN PGP SIGNATURE-----
+Comment: This signature is for the .tar version of the archive
+Comment: git archive --format tar --prefix=liblore-0.4.0/ v0.4.0
+Comment: git version 2.53.0
+
+iHUEABYKAB0WIQR2vl2yUnHhSB5njDW2xBzjVmSZbAUCaanQYwAKCRC2xBzjVmSZ
+bKjgAQD3YbmKZmLUGaP+IY6dMbYR6zqzbfF0Lk9WBOBNzt7xtQD+JOVr7ElvPT1z
+wwMiSwiac0/ke1ewVAYYR5Ca8Eni0QU=
+=XC1q
+-----END PGP SIGNATURE-----
