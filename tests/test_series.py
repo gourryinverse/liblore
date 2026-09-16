@@ -142,7 +142,7 @@ class TestExtractTrailers:
     def test_column_zero_trailers_are_kept(self, make_msg: MsgFactory) -> None:
         msg = make_msg(
             body='Some text\n\nSigned-off-by: Alice <alice@example.com>\n'
-            'Reviewed-by: Bob <bob@example.com>\n'
+            'Reviewed-by: Bob <bob@example.com>\n' + PATCH_TAIL
         )
         assert [(t.name, t.value) for t in extract_trailers(msg)] == [
             ('Signed-off-by', 'Alice <alice@example.com>'),
@@ -155,7 +155,10 @@ class TestExtractTrailers:
 
     def test_indented_trailer_is_kept(self, make_msg: MsgFactory) -> None:
         # Some maintainers send their trailers with leading whitespace.
-        msg = make_msg(body='Thanks!\n\n    Acked-by: Bob <bob@example.com>\n')
+        msg = make_msg(
+            from_addr=('Bob', 'bob@example.com'),
+            body='Thanks!\n\n    Acked-by: Bob <bob@example.com>\n',
+        )
         assert [(t.name, t.value) for t in extract_trailers(msg)] == [
             ('Acked-by', 'Bob <bob@example.com>'),
         ]
@@ -184,7 +187,7 @@ class TestExtractTrailers:
         # so the unhyphenated subsystem prefix must not be picked up.
         msg = make_msg(
             body='usb: fix the thing\n\nSome explanation.\n\n'
-            'Signed-off-by: Alice <alice@example.com>\n'
+            'Signed-off-by: Alice <alice@example.com>\n' + PATCH_TAIL
         )
         assert [t.name for t in extract_trailers(msg)] == ['Signed-off-by']
 
@@ -209,7 +212,10 @@ class TestExtractTrailers:
         assert extract_trailers(msg) == []
 
     def test_key_is_lowercased(self, make_msg: MsgFactory) -> None:
-        msg = make_msg(body='Reviewed-By: Bob <bob@example.com>\n')
+        msg = make_msg(
+            from_addr=('Bob', 'bob@example.com'),
+            body='Reviewed-By: Bob <bob@example.com>\n',
+        )
         assert extract_trailers(msg)[0].key == 'reviewed-by'
 
     def test_wrapped_fixes_trailer_is_rejoined(self, make_msg: MsgFactory) -> None:
@@ -229,6 +235,7 @@ class TestExtractTrailers:
     def test_wrapped_signoff_address_is_rejoined(self, make_msg: MsgFactory) -> None:
         msg = make_msg(
             body=('usb: fix it\n\nSigned-off-by: Alice Longname\n<alice@example.com>\n')
+            + PATCH_TAIL
         )
         assert [(t.name, t.value) for t in extract_trailers(msg)] == [
             ('Signed-off-by', 'Alice Longname <alice@example.com>'),
@@ -242,6 +249,7 @@ class TestExtractTrailers:
                 'Phone: +1 555 0100\n'
                 'E-mail: alice@example.com\n'
             )
+            + PATCH_TAIL
         )
         assert [t.name for t in extract_trailers(msg)] == ['Signed-off-by']
 
@@ -272,6 +280,7 @@ class TestExtractTrailers:
             body=(
                 'usb: fix it\n\nAcked-by: Bob <bob@example.com>\n[for the usb bits]\n'
             )
+            + PATCH_TAIL
         )
         assert [t.name for t in extract_trailers(msg)] == ['Acked-by']
 
@@ -281,18 +290,20 @@ class TestExtractTrailers:
         # A bare "---" in a free-form reply is just a visual separator, so
         # trailers below it still count.
         msg = make_msg(
-            body=('Looks good to me.\n---\nReviewed-by: Bob <bob@example.com>\n')
+            from_addr=('Bob', 'bob@example.com'),
+            body='Looks good to me.\n---\nReviewed-by: Bob <bob@example.com>\n',
         )
         assert [t.name for t in extract_trailers(msg)] == ['Reviewed-by']
 
     def test_signature_block_is_ignored(self, make_msg: MsgFactory) -> None:
         msg = make_msg(
+            from_addr=('Alice', 'alice@example.com'),
             body=(
                 'usb: fix it\n\n'
                 'Signed-off-by: Alice <alice@example.com>\n'
                 '-- \n'
                 'Cc: not-a-real-trailer@example.com\n'
-            )
+            ),
         )
         assert [t.name for t in extract_trailers(msg)] == ['Signed-off-by']
 
@@ -300,23 +311,26 @@ class TestExtractTrailers:
         # Reviewers put their tag wherever they like, so a reply is
         # scanned whole rather than only in its last paragraph.
         msg = make_msg(
+            from_addr=('Bob', 'bob@example.com'),
             body=(
                 'Looks good to me overall.\n\n'
                 'Reviewed-by: Bob <bob@example.com>\n\n'
                 'But please fix the typo in the comment.\n'
-            )
+            ),
         )
         assert [(t.name, t.value) for t in extract_trailers(msg)] == [
             ('Reviewed-by', 'Bob <bob@example.com>'),
         ]
 
     def test_reply_quoted_trailer_still_skipped(self, make_msg: MsgFactory) -> None:
+        # The quoted tag is Bob's own, so only the quoting excludes it.
         msg = make_msg(
+            from_addr=('Bob', 'bob@example.com'),
             body=(
                 'On Mon, Alice wrote:\n'
-                '> Signed-off-by: Alice <alice@example.com>\n\n'
+                '> Reviewed-by: Bob <bob@example.com>\n\n'
                 'Acked-by: Bob <bob@example.com>\n'
-            )
+            ),
         )
         assert [t.name for t in extract_trailers(msg)] == ['Acked-by']
 
@@ -339,15 +353,93 @@ class TestExtractTrailers:
     def test_reply_patch_metadata_is_not_feedback(self, make_msg: MsgFactory) -> None:
         # Quoting a patch's own headers is not the same as offering them.
         msg = make_msg(
+            from_addr=('Bob', 'bob@example.com'),
             body=(
                 'Here is what I applied:\n\n'
                 'From: Alice <alice@example.com>\n'
                 'Subject: [PATCH] usb: fix it\n'
                 'base-commit: deadbeef1234\n\n'
                 'Tested-by: Bob <bob@example.com>\n'
-            )
+            ),
         )
         assert [t.name for t in extract_trailers(msg)] == ['Tested-by']
+
+
+class TestSelfAttestedTrailers:
+    """A reply's person trailer counts only when the sender signs it."""
+
+    def _names(
+        self, sender: tuple[str, str], body: str, make_msg: MsgFactory
+    ) -> list[str]:
+        return [t.name for t in extract_trailers(make_msg(from_addr=sender, body=body))]
+
+    def test_tagging_somebody_else_is_dropped(self, make_msg: MsgFactory) -> None:
+        assert (
+            self._names(
+                ('Bob', 'bob@example.com'),
+                'Alice liked it too:\n\nReviewed-by: Alice <alice@example.com>\n',
+                make_msg,
+            )
+            == []
+        )
+
+    def test_pasted_snippet_is_not_a_trailer(self, make_msg: MsgFactory) -> None:
+        # A device tree snippet quoted in a reply reads as a trailer
+        # whose value happens to look like an address.
+        assert (
+            self._names(
+                ('David', 'david@example.com'),
+                'How about this:\n\n\ti2c0: i2c@... {\n\t\t#size-cells = <0>;\n',
+                make_msg,
+            )
+            == []
+        )
+
+    def test_extended_local_part_still_matches(self, make_msg: MsgFactory) -> None:
+        assert self._names(
+            ('Bob', 'bob+kernel@example.com'),
+            'Acked-by: Bob <bob@example.com>\n',
+            make_msg,
+        ) == ['Acked-by']
+
+    def test_subdomain_still_matches(self, make_msg: MsgFactory) -> None:
+        assert self._names(
+            ('Bob', 'bob@example.com'),
+            'Acked-by: Bob <bob@linux.example.com>\n',
+            make_msg,
+        ) == ['Acked-by']
+
+    def test_name_match_rescues_a_different_address(self, make_msg: MsgFactory) -> None:
+        # Maintainers often post from one address and tag from another.
+        assert self._names(
+            ('Mikael Renberg', 'mrenberg@example.com'),
+            'Acked-by: Mikael Renberg <mikael@oss.example.org>\n',
+            make_msg,
+        ) == ['Acked-by']
+
+    def test_comma_reversed_name_matches(self, make_msg: MsgFactory) -> None:
+        assert self._names(
+            ('Okonkwo, Amara', 'aokonkwo@example.com'),
+            'Reviewed-by: Amara Okonkwo <amara@other.example.org>\n',
+            make_msg,
+        ) == ['Reviewed-by']
+
+    def test_utility_trailers_need_no_attestation(self, make_msg: MsgFactory) -> None:
+        # There is no identity in a Fixes: or a Link:, so nothing to match.
+        assert self._names(
+            ('Bob', 'bob@example.com'),
+            'This one:\n\nFixes: deadbeef1234 ("usb: break it")\n',
+            make_msg,
+        ) == ['Fixes']
+
+    def test_a_patch_is_not_subject_to_the_rule(self, make_msg: MsgFactory) -> None:
+        # A patch collects everybody's tags; the sender signs for them.
+        assert self._names(
+            ('Alice', 'alice@example.com'),
+            'usb: fix it\n\nSigned-off-by: Alice <alice@example.com>\n'
+            'Reviewed-by: Bob <bob@example.com>\n' + PATCH_TAIL,
+            make_msg,
+        ) == ['Signed-off-by', 'Reviewed-by']
 
 
 class TestInbodyAuthor:
@@ -487,6 +579,7 @@ class TestSummarizeThread:
         patch = make_msg(subject='[PATCH 1/1] usb: fix it', msgid='r1@x', date=DATE1)
         reply = make_msg(
             subject='Re: [PATCH 1/1] usb: fix it',
+            from_addr=('Bob', 'bob@example.com'),
             msgid='r2@x',
             in_reply_to='r1@x',
             date=DATE2,
@@ -547,17 +640,20 @@ class TestSummarizeThread:
             subject='[PATCH] x',
             msgid='td1@x',
             date=DATE1,
-            body='x\n\nSigned-off-by: Alice <alice@example.com>\n',
+            body='x\n\nSigned-off-by: Alice <alice@example.com>\n' + PATCH_TAIL,
         )
-        reply = make_msg(
-            subject='Re: [PATCH] x',
-            msgid='td2@x',
-            in_reply_to='td1@x',
-            date=DATE2,
-            body='Signed-off-by: Alice <alice@example.com>\n'
-            'Acked-by: Bob <bob@example.com>\n',
-        )
-        summary = summarize_thread([patch, reply])
+        replies = [
+            make_msg(
+                subject='Re: [PATCH] x',
+                from_addr=('Bob', 'bob@example.com'),
+                msgid=f'td{n}@x',
+                in_reply_to='td1@x',
+                date=DATE2,
+                body='Acked-by: Bob <bob@example.com>\n',
+            )
+            for n in (2, 3)
+        ]
+        summary = summarize_thread([patch, *replies])
         assert [(t.name, t.value) for t in summary.trailers] == [
             ('Signed-off-by', 'Alice <alice@example.com>'),
             ('Acked-by', 'Bob <bob@example.com>'),

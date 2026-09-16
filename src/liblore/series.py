@@ -89,6 +89,9 @@ _RE_MAILTO = re.compile(r'<mailto:[^>]+>')
 # A value that names an email address somewhere inside it.
 _RE_HAS_ADDR = re.compile(r'\S+@\S+\.\S+')
 
+# An extended local part, as in foo+kernel@example.com.
+_RE_EXTENDED_LOCAL = re.compile(r'\+[^@]+@')
+
 # Patch and commit metadata that is not review feedback.  A reply that
 # quotes a patch's own headers should not be read as having offered
 # them, so these are dropped from replies (b4 does the same).
@@ -360,6 +363,58 @@ def parse_patch_subject(subject: str) -> PatchSubject:
     )
 
 
+def _email_eq(one: str, two: str) -> bool:
+    """Whether two addresses name the same mailbox, as b4 compares them."""
+    one, two = one.lower(), two.lower()
+    if one == two:
+        return True
+    if '@' not in one or '@' not in two:
+        return False
+    # An extended local part is still the same mailbox, so
+    # foo+kernel@example.com matches foo@example.com.
+    one = _RE_EXTENDED_LOCAL.sub('@', one)
+    two = _RE_EXTENDED_LOCAL.sub('@', two)
+    if one == two:
+        return True
+    # One domain may be a subdomain of the other, which covers the
+    # foo@linux.intel.com and foo@intel.com pairing.
+    olocal, odomain = one.split('@', maxsplit=1)
+    tlocal, tdomain = two.split('@', maxsplit=1)
+    if olocal != tlocal:
+        return False
+    return abs(odomain.count('.') - tdomain.count('.')) == 1 and (
+        odomain.endswith(f'.{tdomain}') or tdomain.endswith(f'.{odomain}')
+    )
+
+
+def _name_eq(tname: str, fromname: str) -> bool:
+    """Whether a trailer's name is the same name as the sender's."""
+    tname, fromname = tname.lower().strip(), fromname.lower().strip()
+    if not tname or not fromname:
+        return False
+    if tname == fromname:
+        return True
+    # A From: written "Okonkwo, Amara" still matches a trailer
+    # signed "Amara Okonkwo".
+    chunks = [chunk.strip() for chunk in fromname.split(',') if chunk.strip()]
+    if len(chunks) < 2:
+        return False
+    return all(chunk in tname for chunk in chunks)
+
+
+def _is_self_attested(trailer: Trailer, author: tuple[str, str]) -> bool:
+    """Whether a reply's person trailer was offered by the sender.
+
+    b4 accepts a follow-up trailer only from the person it names: you
+    may tag on your own behalf, not on somebody else's.  Trailers that
+    name nobody -- ``Fixes:``, ``Link:`` and the like -- are not subject
+    to this, since there is no identity to compare.
+    """
+    if trailer.addr is None:
+        return True
+    return _email_eq(trailer.addr[1], author[1]) or _name_eq(trailer.addr[0], author[0])
+
+
 def extract_trailers(msg: EmailMessage) -> list[Trailer]:
     """Return every trailer line found in a message body, in order.
 
@@ -379,6 +434,10 @@ def extract_trailers(msg: EmailMessage) -> list[Trailer]:
     ``base-commit:`` is dropped, since a reply quoting a patch's headers
     has not thereby offered them.
 
+    A reply's person trailer counts only when the sender named himself
+    or herself in it, which is how b4 keeps a quoted or pasted address
+    from being read as a fresh endorsement.
+
     A trailer may be indented -- some maintainers send them that way --
     but one behind a ``>`` quoting marker is a copy of a trailer
     somebody wrote elsewhere and does not count here.
@@ -386,10 +445,16 @@ def extract_trailers(msg: EmailMessage) -> list[Trailer]:
     body = msg_get_payload(msg, strip_signature=False)
     if body_has_diff(body):
         found = split_body_parts(body).trailers
-    else:
-        found, _others = find_trailers(body, followup=True)
-        found = [(n, v) for n, v in found if n.lower() not in _REPLY_IGNORES]
-    return [Trailer.parse(name, value) for name, value in found]
+        return [Trailer.parse(name, value) for name, value in found]
+
+    found, _others = find_trailers(body, followup=True)
+    found = [(n, v) for n, v in found if n.lower() not in _REPLY_IGNORES]
+    author = msg_get_author(msg)
+    return [
+        trailer
+        for trailer in (Trailer.parse(name, value) for name, value in found)
+        if _is_self_attested(trailer, author)
+    ]
 
 
 def _thread_parents(msg: EmailMessage) -> set[str]:
