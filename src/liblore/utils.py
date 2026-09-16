@@ -162,6 +162,22 @@ _TRAILER_IGNORES = frozenset(
 # Only meaningful as in-body git headers, and only before any other text.
 _TRAILER_HEADERS = frozenset({'subject', 'date', 'from'})
 
+# Trailers whose value is a URL rather than a person.
+_TRAILER_LINKS = frozenset({'link', 'buglink', 'closes'})
+
+# Trailers that legitimately carry no email address.
+_TRAILER_NONPERSON = _TRAILER_LINKS | {
+    'fixes',
+    'subject',
+    'date',
+    'obsoleted-by',
+    'change-id',
+    'base-commit',
+}
+
+_RE_VALUE_EMAIL = re.compile(r'\S+@\S+\.\S+')
+_RE_VALUE_LINK = re.compile(r'https?://')
+
 
 class BodyParts(NamedTuple):
     """The pieces a patch or reply body splits into.
@@ -180,13 +196,23 @@ class BodyParts(NamedTuple):
     signature: str
 
 
-def find_trailers(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+def find_trailers(
+    text: str, followup: bool = False
+) -> tuple[list[tuple[str, str]], list[str]]:
     """Find ``Name: value`` trailers in a block of text.
 
     A trailer starts at the beginning of a line and may be indented, since
     some maintainers send theirs with leading whitespace.  A quoted one
     is still excluded, because a quoting marker such as ``>`` is not a
     word character.
+
+    With *followup* set, the much stricter rules b4 applies to replies
+    are used: the name must be ASCII, the value must contain an email
+    address unless the trailer is a kind that legitimately has none, and
+    a URL is only allowed in a link trailer.  That strictness is what
+    makes it safe to scan a whole reply rather than just its last
+    paragraph, which is how a ``Reviewed-by:`` written in the middle of
+    a reply still gets found.
 
     Returns ``(trailers, other_lines)``.  Mail clients like to wrap long
     trailers, so a ``Fixes:`` hash comment or a bare ``<address>`` that
@@ -219,6 +245,17 @@ def find_trailers(text: str) -> tuple[list[tuple[str, str]], list[str]]:
             if others and lname in _TRAILER_HEADERS:
                 # A git header only counts before any other content.
                 continue
+            if followup:
+                if not lname.isascii():
+                    continue
+                if (
+                    not _RE_VALUE_EMAIL.search(value)
+                    and lname not in _TRAILER_NONPERSON
+                ):
+                    # A person trailer has to name a person.
+                    continue
+                if _RE_VALUE_LINK.search(value) and lname not in _TRAILER_LINKS:
+                    continue
             if lname == 'fixes' and not re.match(r'^[0-9a-f]{6,}', value):
                 continue
             extinfo = re.search(r'(.*\S+)(\s+#[^#]+)$', value)
@@ -235,6 +272,11 @@ def find_trailers(text: str) -> tuple[list[tuple[str, str]], list[str]]:
         others.append(line)
 
     return trailers, others
+
+
+def body_has_diff(body: str) -> bool:
+    """Whether a body carries actual diff content, as opposed to quoting it."""
+    return bool(_RE_DIFF.search(body) or _RE_DIFFSTAT.search(body))
 
 
 def split_body_parts(body: str) -> BodyParts:
@@ -257,7 +299,7 @@ def split_body_parts(body: str) -> BodyParts:
     parts = [body]
     # Only split on "---" for messages that actually carry a diff; in a
     # free-form reply it is just a visual separator.
-    if _RE_DIFF.search(body) or _RE_DIFFSTAT.search(body):
+    if body_has_diff(body):
         parts = re.split(r'^---\s*\n', body, maxsplit=1, flags=re.MULTILINE)
         if len(parts) == 2:
             basement = parts[1]

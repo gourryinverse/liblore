@@ -180,10 +180,17 @@ class TestExtractTrailers:
 
     def test_unhyphenated_trailers_are_kept(self, make_msg: MsgFactory) -> None:
         msg = make_msg(
-            body='net: fix it\n\n'
-            'Fixes: deadbeef1234 ("net: break it")\n'
-            'Cc: stable@vger.kernel.org\n'
-            'Link: https://lore.kernel.org/r/x@y\n'
+            body=(
+                'net: fix it\n\n'
+                'Fixes: deadbeef1234 ("net: break it")\n'
+                'Cc: stable@vger.kernel.org\n'
+                'Link: https://lore.kernel.org/r/x@y\n'
+                '---\n'
+                ' net/core.c | 2 +-\n'
+                ' 1 file changed, 1 insertion(+), 1 deletion(-)\n'
+                '--- a/net/core.c\n'
+                '+++ b/net/core.c\n'
+            )
         )
         assert [t.name for t in extract_trailers(msg)] == ['Fixes', 'Cc', 'Link']
 
@@ -235,7 +242,17 @@ class TestExtractTrailers:
     def test_extinfo_comment_is_stripped(self, make_msg: MsgFactory) -> None:
         # Stripping the comment also means the same trailer with and
         # without one deduplicates to a single entry.
-        msg = make_msg(body='usb: fix it\n\nCc: stable@vger.kernel.org # 5.10+\n')
+        msg = make_msg(
+            body=(
+                'usb: fix it\n\n'
+                'Cc: stable@vger.kernel.org # 5.10+\n'
+                '---\n'
+                ' net/core.c | 2 +-\n'
+                ' 1 file changed, 1 insertion(+), 1 deletion(-)\n'
+                '--- a/net/core.c\n'
+                '+++ b/net/core.c\n'
+            )
+        )
         assert [(t.name, t.value) for t in extract_trailers(msg)] == [
             ('Cc', 'stable@vger.kernel.org'),
         ]
@@ -268,6 +285,59 @@ class TestExtractTrailers:
             )
         )
         assert [t.name for t in extract_trailers(msg)] == ['Signed-off-by']
+
+    def test_reply_trailer_mid_body_is_found(self, make_msg: MsgFactory) -> None:
+        # Reviewers put their tag wherever they like, so a reply is
+        # scanned whole rather than only in its last paragraph.
+        msg = make_msg(
+            body=(
+                'Looks good to me overall.\n\n'
+                'Reviewed-by: Bob <bob@example.com>\n\n'
+                'But please fix the typo in the comment.\n'
+            )
+        )
+        assert [(t.name, t.value) for t in extract_trailers(msg)] == [
+            ('Reviewed-by', 'Bob <bob@example.com>'),
+        ]
+
+    def test_reply_quoted_trailer_still_skipped(self, make_msg: MsgFactory) -> None:
+        msg = make_msg(
+            body=(
+                'On Mon, Alice wrote:\n'
+                '> Signed-off-by: Alice <alice@example.com>\n\n'
+                'Acked-by: Bob <bob@example.com>\n'
+            )
+        )
+        assert [t.name for t in extract_trailers(msg)] == ['Acked-by']
+
+    def test_reply_person_trailer_needs_an_address(self, make_msg: MsgFactory) -> None:
+        msg = make_msg(body='Nice.\n\nAssisted-by: LLM\n\nBut fix the typo.\n')
+        assert extract_trailers(msg) == []
+
+    def test_reply_url_only_allowed_in_link_trailers(
+        self, make_msg: MsgFactory
+    ) -> None:
+        msg = make_msg(
+            body=(
+                'See below.\n\n'
+                'Link: https://lore.kernel.org/r/x@y\n'
+                'Reviewed-by: https://example.com/not-a-person\n'
+            )
+        )
+        assert [t.name for t in extract_trailers(msg)] == ['Link']
+
+    def test_reply_patch_metadata_is_not_feedback(self, make_msg: MsgFactory) -> None:
+        # Quoting a patch's own headers is not the same as offering them.
+        msg = make_msg(
+            body=(
+                'Here is what I applied:\n\n'
+                'From: Alice <alice@example.com>\n'
+                'Subject: [PATCH] usb: fix it\n'
+                'base-commit: deadbeef1234\n\n'
+                'Tested-by: Bob <bob@example.com>\n'
+            )
+        )
+        assert [t.name for t in extract_trailers(msg)] == ['Tested-by']
 
 
 class TestInbodyAuthor:

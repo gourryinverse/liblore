@@ -24,7 +24,9 @@ from email.message import EmailMessage
 from typing import Any
 
 from liblore.utils import (
+    body_has_diff,
     clean_header,
+    find_trailers,
     get_clean_msgid,
     msg_get_author,
     msg_get_date,
@@ -56,6 +58,25 @@ _RE_VERSION = re.compile(r'^v(\d+)$', re.IGNORECASE)
 # An "n/m" counter token, after whitespace around the slash is removed.
 # Bounded, so a date or a version range cannot pose as a counter.
 _RE_COUNTER = re.compile(r'^(\d{1,4})/(\d{1,4})$')
+
+# Patch and commit metadata that is not review feedback.  A reply that
+# quotes a patch's own headers should not be read as having offered
+# them, so these are dropped from replies (b4 does the same).
+_REPLY_IGNORES = frozenset(
+    {
+        'author',
+        'base-commit',
+        'cc',
+        'change-id',
+        'date',
+        'from',
+        'message-id',
+        'subject',
+        'subscribe',
+        'to',
+        'unsubscribe',
+    }
+)
 
 
 def _isoformat(when: datetime.datetime | None) -> str | None:
@@ -245,19 +266,33 @@ def parse_patch_subject(subject: str) -> PatchSubject:
 def extract_trailers(msg: EmailMessage) -> list[Trailer]:
     """Return every trailer line found in a message body, in order.
 
-    Trailers are taken from the last paragraph of the message proper, the
-    way git and b4 read them.  That is what keeps an ordinary commit
-    subject such as ``usb: fix the thing`` from being read as a trailer
-    named ``usb``: it lives in the first paragraph, not the trailing
-    block.  Everything below the ``---`` separator of a patch, and
-    everything below a ``-- `` signature marker, is ignored.
+    How a message is read depends on what it is, which is what b4 does
+    too.
+
+    A message carrying a diff is a patch, so its trailers are taken from
+    the last paragraph of the message proper -- above the ``---``, below
+    the commit message.  That is what keeps an ordinary commit subject
+    such as ``usb: fix the thing`` from being read as a trailer named
+    ``usb``: it lives in the first paragraph, not the trailing block.
+
+    Anything else is a reply, and reviewers put their tags wherever they
+    like, so the whole body is scanned.  The stricter follow-up rules
+    apply there -- a person trailer must name a person, a URL only
+    belongs in a link trailer -- and patch metadata such as ``From:`` or
+    ``base-commit:`` is dropped, since a reply quoting a patch's headers
+    has not thereby offered them.
 
     A trailer may be indented -- some maintainers send them that way --
     but one behind a ``>`` quoting marker is a copy of a trailer
     somebody wrote elsewhere and does not count here.
     """
-    parts = split_body_parts(msg_get_payload(msg, strip_signature=False))
-    return [Trailer(name=name, value=value) for name, value in parts.trailers]
+    body = msg_get_payload(msg, strip_signature=False)
+    if body_has_diff(body):
+        found = split_body_parts(body).trailers
+    else:
+        found, _others = find_trailers(body, followup=True)
+        found = [(n, v) for n, v in found if n.lower() not in _REPLY_IGNORES]
+    return [Trailer(name=name, value=value) for name, value in found]
 
 
 def _thread_parents(msg: EmailMessage) -> set[str]:
