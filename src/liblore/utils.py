@@ -16,6 +16,7 @@ import textwrap
 import urllib.parse
 from collections.abc import Sequence
 from email.message import EmailMessage
+from typing import NamedTuple
 
 from liblore import emlpolicy
 
@@ -131,8 +132,205 @@ def msg_get_subject(msg: EmailMessage, strip_prefixes: bool = False) -> str:
     return subject.strip()
 
 
-def msg_get_author(msg: EmailMessage) -> tuple[str, str]:
-    """Return ``(name, email)`` for the From header."""
+# Detecting real diff content, so a bare "---" in a free-form reply is
+# not mistaken for a patch separator.  Both mirror b4, which has had the
+# corner cases beaten out of it against the real lore corpus.
+_RE_DIFF = re.compile(
+    r'^(---.*\n\+\+\+|GIT binary patch|diff --git \w/\S+ \w/\S+)',
+    flags=re.MULTILINE | re.IGNORECASE,
+)
+_RE_DIFFSTAT = re.compile(
+    r'^\s*\d+ file.*\d+ (insertion|deletion)',
+    flags=re.MULTILINE | re.IGNORECASE,
+)
+
+# A trailer line, as b4 matches it: at the start of a line, optionally
+# indented, because some maintainers do send their trailers with leading
+# whitespace.  The name must begin with a word character, which is what
+# keeps a quoted "> Reviewed-by:" out without having to parse quoting
+# styles at all.
+_RE_TRAILER_LINE = re.compile(r'^\s*(\w\S+):\s+(\S.*)$')
+
+# An "[for the foo bits]" line continuing the trailer above it.
+_RE_TRAILER_EXTINFO = re.compile(r'^\s*\[[^]]+]\s*$')
+
+# Values that look like trailers but never are.
+_TRAILER_IGNORES = frozenset(
+    {'phone', 'mail', 'email', 'e-mail', 'prerequisite-message-id'}
+)
+
+# Only meaningful as in-body git headers, and only before any other text.
+_TRAILER_HEADERS = frozenset({'subject', 'date', 'from'})
+
+
+class BodyParts(NamedTuple):
+    """The pieces a patch or reply body splits into.
+
+    *githeaders* are the in-body ``From:``/``Subject:``/``Date:`` headers
+    git recognises at the very start of a patch, *trailers* are the
+    trailing ``Name: value`` block, *basement* is everything below the
+    ``---`` separator (diffstat and diff), and *signature* is the text
+    below a conformant ``-- `` marker.
+    """
+
+    githeaders: list[tuple[str, str]]
+    message: str
+    trailers: list[tuple[str, str]]
+    basement: str
+    signature: str
+
+
+def find_trailers(text: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Find ``Name: value`` trailers in a block of text.
+
+    A trailer starts at the beginning of a line and may be indented, since
+    some maintainers send theirs with leading whitespace.  A quoted one
+    is still excluded, because a quoting marker such as ``>`` is not a
+    word character.
+
+    Returns ``(trailers, other_lines)``.  Mail clients like to wrap long
+    trailers, so a ``Fixes:`` hash comment or a bare ``<address>`` that
+    spilled onto the next line is rejoined before scanning.  Trailing
+    ``# extra info`` is stripped from values, which also means the same
+    trailer with and without a comment deduplicates to one entry.
+    """
+    # Ignore everything below the standard email signature marker.
+    text = text.split('\n-- \n', 1)[0].strip() + '\n'
+    # Fixes: abcd0123 (foo bar
+    # baz quux)
+    text = re.sub(
+        r'^(\S+:\s+[\da-f]+\s+\([^)]+)\n([^\n]+\))', r'\1 \2', text, flags=re.MULTILINE
+    )
+    # Signed-off-by: Long Name
+    # <email.here@example.com>
+    text = re.sub(r'^(\S+:\s+[^<]+)\n(<[^>]+>)$', r'\1 \2', text, flags=re.MULTILINE)
+
+    trailers: list[tuple[str, str]] = []
+    others: list[str] = []
+    was_trailer = False
+    for line in text.split('\n'):
+        line = line.strip('\r')
+        match = _RE_TRAILER_LINE.match(line)
+        if match:
+            name, value = match.group(1), match.group(2)
+            lname = name.lower()
+            if lname in _TRAILER_IGNORES:
+                continue
+            if others and lname in _TRAILER_HEADERS:
+                # A git header only counts before any other content.
+                continue
+            if lname == 'fixes' and not re.match(r'^[0-9a-f]{6,}', value):
+                continue
+            extinfo = re.search(r'(.*\S+)(\s+#[^#]+)$', value)
+            if extinfo:
+                value = extinfo.group(1)
+            was_trailer = True
+            trailers.append((name, value.strip()))
+            continue
+        if len(line) > 2 and was_trailer and _RE_TRAILER_EXTINFO.match(line):
+            # Continuation of the trailer above, not new content.
+            was_trailer = False
+            continue
+        was_trailer = False
+        others.append(line)
+
+    return trailers, others
+
+
+def split_body_parts(body: str) -> BodyParts:
+    """Split a message body into git headers, message, trailers and diff.
+
+    Trailers are taken from the *last* paragraph of the message and
+    in-body git headers from the *first*, which is what keeps an
+    ordinary commit subject such as ``usb: fix the thing`` from being
+    read as a trailer named ``usb`` -- it sits in the first paragraph,
+    not the trailing block.
+    """
+    body = body.replace('\r', '').strip('\n')
+    signature = ''
+    sparts = body.rsplit('\n-- \n', 1)
+    if len(sparts) > 1:
+        signature = sparts[1]
+        body = sparts[0]
+
+    basement = ''
+    parts = [body]
+    # Only split on "---" for messages that actually carry a diff; in a
+    # free-form reply it is just a visual separator.
+    if _RE_DIFF.search(body) or _RE_DIFFSTAT.search(body):
+        parts = re.split(r'^---\s*\n', body, maxsplit=1, flags=re.MULTILINE)
+        if len(parts) == 2:
+            basement = parts[1]
+        elif body.find('\ndiff ') >= 0:
+            parts = body.split('\ndiff ', 1)
+            if len(parts) == 2:
+                parts[1] = 'diff ' + parts[1]
+                basement = parts[1]
+        elif body.find('\n--- a/') >= 0:
+            # Patches generated by some really peculiar tools.
+            parts = body.split('\n--- a/', 1)
+            if len(parts) == 2:
+                parts[1] = '--- a/' + parts[1]
+                basement = parts[1]
+
+    paragraphs = parts[0].strip('\n').split('\n\n')
+
+    githeaders: list[tuple[str, str]] = []
+    mparts: list[str] = []
+    head, other = find_trailers(paragraphs[0])
+    if [line for line in other if line.strip()]:
+        # Not every line was a header, so it is ordinary content.
+        mparts.append(paragraphs[0])
+    else:
+        githeaders = head
+
+    trailers, nlines = find_trailers(paragraphs[-1])
+
+    if len(paragraphs) == 1:
+        if githeaders == trailers:
+            # A message that consists of nothing but trailers.
+            githeaders = []
+        return BodyParts(githeaders, '\n'.join(nlines), trailers, basement, signature)
+
+    if len(paragraphs) > 2:
+        mparts += paragraphs[1:-1]
+    if nlines:
+        mparts.append('\n'.join(nlines))
+
+    return BodyParts(githeaders, '\n\n'.join(mparts), trailers, basement, signature)
+
+
+def msg_get_inbody_author(msg: EmailMessage) -> tuple[str, str] | None:
+    """Return ``(name, email)`` from a git-style in-body ``From:`` line.
+
+    ``git mailinfo`` lets a patch name its real author by starting the
+    body with a ``From:`` line, which overrides the header.  This is how
+    a patch keeps correct authorship when it is relayed through a
+    remailer or a mailing list that rewrites the ``From:`` header, so
+    the header alone cannot be trusted to name the author.
+
+    Returns ``None`` when there is no in-body ``From:``.
+    """
+    parts = split_body_parts(msg_get_payload(msg, strip_signature=False))
+    for name, value in parts.githeaders:
+        if name.lower() == 'from':
+            addrs = email.utils.getaddresses([clean_header(value)])
+            if addrs and addrs[0][1]:
+                return addrs[0]
+    return None
+
+
+def msg_get_author(msg: EmailMessage, use_inbody: bool = False) -> tuple[str, str]:
+    """Return ``(name, email)`` for the From header.
+
+    When *use_inbody* is ``True``, a git-style in-body ``From:`` line
+    takes precedence over the header, matching what ``git am`` would
+    record as the author.  See :func:`msg_get_inbody_author`.
+    """
+    if use_inbody:
+        inbody = msg_get_inbody_author(msg)
+        if inbody is not None:
+            return inbody
     author = ('', 'missing@address.local')
     fh = msg.get('from')
     if fh:
@@ -316,28 +514,40 @@ def msg_get_recipients(msg: EmailMessage) -> set[str]:
     return {x[1].lower() for x in pairs}
 
 
+def msg_get_date(msg: EmailMessage) -> datetime.datetime | None:
+    """Return the message timestamp, preferring Received over Date.
+
+    Uses the latest ``Received`` header timestamp when one is present,
+    because those are stamped by the receiving servers rather than by
+    the sender, and falls back to the client-set ``Date`` header.
+    Returns ``None`` when neither yields a parsable timestamp.
+    """
+    latest_rdt: datetime.datetime | None = None
+    for rhdr in msg.get_all('Received', []):
+        # Received headers generally end with "; datetimeinfo"
+        chunks = str(rhdr).rsplit(';', maxsplit=1)
+        if len(chunks) < 2:
+            continue
+        rdate = chunks[1].strip()
+        try:
+            rdt = email.utils.parsedate_to_datetime(rdate)
+        except (ValueError, TypeError):
+            continue
+        if not latest_rdt or latest_rdt < rdt:
+            latest_rdt = rdt
+    if not latest_rdt and msg.get('Date'):
+        try:
+            latest_rdt = email.utils.parsedate_to_datetime(str(msg.get('Date')))
+        except (ValueError, TypeError):
+            pass
+    return latest_rdt
+
+
 def sort_msgs_by_received(msgs: list[EmailMessage]) -> list[EmailMessage]:
     """Sort messages by latest Received header timestamp, falling back to Date."""
     tosort: list[tuple[datetime.datetime, EmailMessage]] = []
     for msg in msgs:
-        latest_rdt: datetime.datetime | None = None
-        for rhdr in msg.get_all('Received', []):
-            # Received headers generally end with "; datetimeinfo"
-            chunks = str(rhdr).rsplit(';', maxsplit=1)
-            if len(chunks) < 2:
-                continue
-            rdate = chunks[1].strip()
-            try:
-                rdt = email.utils.parsedate_to_datetime(rdate)
-            except (ValueError, TypeError):
-                continue
-            if not latest_rdt or latest_rdt < rdt:
-                latest_rdt = rdt
-        if not latest_rdt and msg.get('Date'):
-            try:
-                latest_rdt = email.utils.parsedate_to_datetime(str(msg.get('Date')))
-            except (ValueError, TypeError):
-                pass
+        latest_rdt = msg_get_date(msg)
         if not latest_rdt:
             logger.debug('Message without a date: %s!', msg.get('Message-ID'))
             continue
