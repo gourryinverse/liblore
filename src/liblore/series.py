@@ -17,6 +17,7 @@ messages, get back frozen dataclasses that serialise cleanly via
 from __future__ import annotations
 
 import datetime
+import email.utils
 import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from liblore.utils import (
     body_has_diff,
     clean_header,
     find_trailers,
+    format_addrs,
     get_clean_msgid,
     msg_get_author,
     msg_get_date,
@@ -59,6 +61,34 @@ _RE_VERSION = re.compile(r'^v(\d+)$', re.IGNORECASE)
 # Bounded, so a date or a version range cannot pose as a counter.
 _RE_COUNTER = re.compile(r'^(\d{1,4})/(\d{1,4})$')
 
+# Trailers that record a fact about the patch rather than a person's
+# endorsement of it.  Taken from b4, which has the better-researched
+# vocabulary here.
+_UTILITY_TRAILERS = frozenset(
+    {
+        'base-commit',
+        'based-on',
+        'buglink',
+        'change-id',
+        'closes',
+        'fixes',
+        'link',
+        'message-id',
+        'obsoleted-by',
+    }
+)
+
+# A "Name <address>" trailer value, parsed by hand: email.utils.parseaddr
+# applies RFC 2822 semantics that mangle display names holding quotes,
+# commas or parentheses, and a trailer is plain text, not a header.
+_RE_TRAILER_ADDR = re.compile(r'^(.*?)\s*<([^>]+)>\s*$')
+
+# Inserted by mail clients that back-convert from HTML mail.
+_RE_MAILTO = re.compile(r'<mailto:[^>]+>')
+
+# A value that names an email address somewhere inside it.
+_RE_HAS_ADDR = re.compile(r'\S+@\S+\.\S+')
+
 # Patch and commit metadata that is not review feedback.  A reply that
 # quotes a patch's own headers should not be read as having offered
 # them, so these are dropped from replies (b4 does the same).
@@ -86,15 +116,61 @@ def _isoformat(when: datetime.datetime | None) -> str | None:
 
 @dataclass(frozen=True)
 class Trailer:
-    """A ``Name: value`` trailer line seen somewhere in a thread."""
+    """A ``Name: value`` trailer line seen somewhere in a thread.
+
+    *type* is one of ``person`` (an endorsement by somebody, with *addr*
+    holding their parsed name and email), ``utility`` (a fact about the
+    patch, such as ``Fixes:`` or ``base-commit:``) or ``unknown`` (a
+    trailer we could make no sense of).  The split follows b4's.
+    """
 
     name: str
     value: str
+    type: str = 'unknown'
+    addr: tuple[str, str] | None = None
+
+    @classmethod
+    def parse(cls, name: str, value: str) -> Trailer:
+        """Classify a raw ``name``/``value`` pair into a trailer.
+
+        A person trailer's value is normalised while we are here, so
+        that a stray space inside the brackets or a ``<mailto:>`` tag
+        left behind by an HTML mail client does not make two copies of
+        the same endorsement look like two different ones.
+        """
+        if name.lower() in _UTILITY_TRAILERS or '://' in value:
+            return cls(name=name, value=value, type='utility')
+        if not _RE_HAS_ADDR.search(value):
+            return cls(name=name, value=value)
+        value = _RE_MAILTO.sub('', value).strip()
+        match = _RE_TRAILER_ADDR.match(value)
+        if match:
+            addr = (match.group(1).strip(), match.group(2).strip())
+        else:
+            addr = email.utils.parseaddr(value)
+        if not addr[0] and not addr[1]:
+            return cls(name=name, value=value)
+        return cls(
+            name=name,
+            value=format_addrs([addr], clean=False),
+            type='person',
+            addr=addr,
+        )
 
     @property
     def key(self) -> str:
         """The trailer name lowercased, for case-insensitive matching."""
         return self.name.lower()
+
+    @property
+    def is_utility(self) -> bool:
+        """Whether this records a fact rather than somebody's endorsement."""
+        return self.type == 'utility'
+
+    @property
+    def is_person(self) -> bool:
+        """Whether this is an endorsement by an identifiable person."""
+        return self.type == 'person'
 
 
 @dataclass(frozen=True)
@@ -121,6 +197,10 @@ class PatchSubject:
 class ThreadSummary:
     """Descriptive facts about a single thread.
 
+    ``msgids`` lists every message in the thread, the root first and
+    the rest oldest-first, so a caller can go back to any individual
+    message without re-deriving the grouping.
+
     The patch fields describe what the submissions in the thread *said
     about themselves*.  In particular ``patch_count`` is how many
     patches were seen and ``expected`` is how many the brackets claimed
@@ -133,6 +213,7 @@ class ThreadSummary:
     count: int
     first: datetime.datetime | None
     last: datetime.datetime | None
+    msgids: tuple[str, ...] = ()
     is_patch_series: bool = False
     patch_count: int = 0
     expected: int = 0
@@ -147,6 +228,16 @@ class ThreadSummary:
         """Every trailer name seen in the thread, lowercased."""
         return frozenset(trailer.key for trailer in self.trailers)
 
+    @property
+    def person_trailers(self) -> tuple[Trailer, ...]:
+        """Trailers that are somebody's endorsement of the patches."""
+        return tuple(trailer for trailer in self.trailers if trailer.is_person)
+
+    @property
+    def utility_trailers(self) -> tuple[Trailer, ...]:
+        """Trailers that record a fact, such as ``Fixes:`` or ``Link:``."""
+        return tuple(trailer for trailer in self.trailers if trailer.is_utility)
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serialisable view of this summary.
 
@@ -157,6 +248,7 @@ class ThreadSummary:
             'msgid': self.msgid,
             'subject': self.subject,
             'count': self.count,
+            'msgids': list(self.msgids),
             'first': _isoformat(self.first),
             'last': _isoformat(self.last),
             'is_patch_series': self.is_patch_series,
@@ -169,7 +261,12 @@ class ThreadSummary:
                 {'name': name, 'email': addr} for name, addr in self.participants
             ],
             'trailers': [
-                {'name': trailer.name, 'value': trailer.value}
+                {
+                    'name': trailer.name,
+                    'value': trailer.value,
+                    'type': trailer.type,
+                    'email': trailer.addr[1] if trailer.addr else None,
+                }
                 for trailer in self.trailers
             ],
         }
@@ -292,7 +389,7 @@ def extract_trailers(msg: EmailMessage) -> list[Trailer]:
     else:
         found, _others = find_trailers(body, followup=True)
         found = [(n, v) for n, v in found if n.lower() not in _REPLY_IGNORES]
-    return [Trailer(name=name, value=value) for name, value in found]
+    return [Trailer.parse(name, value) for name, value in found]
 
 
 def _thread_parents(msg: EmailMessage) -> set[str]:
@@ -377,8 +474,40 @@ def _sort_key(when: datetime.datetime | None) -> datetime.datetime:
     return when
 
 
+def _patch_order(msg: EmailMessage) -> int:
+    """Where a patch sits in its series, for breaking ties on the date.
+
+    ``git send-email`` stamps a whole series within the same second, so
+    dates alone leave the patches in whatever order they arrived in.
+    """
+    parsed = parse_patch_subject(msg_get_subject(msg))
+    if not parsed.is_patch or parsed.is_reply or parsed.counters_inferred:
+        return -1
+    return parsed.counter
+
+
 def _sort_by_date(msgs: Sequence[EmailMessage]) -> list[EmailMessage]:
-    return sorted(msgs, key=lambda msg: _sort_key(msg_get_date(msg)))
+    return sorted(
+        msgs, key=lambda msg: (_sort_key(msg_get_date(msg)), _patch_order(msg))
+    )
+
+
+def _collect_msgids(
+    root: EmailMessage, ordered: Sequence[EmailMessage]
+) -> tuple[str, ...]:
+    """List the thread's message-ids, root first and the rest in order.
+
+    The root leads even when it is not the oldest message: a cover
+    letter can carry a timestamp a second later than the first patch,
+    and a caller reading ``msgids[0]`` should get the same message as
+    ``msgid``.
+    """
+    found = [msgid for msgid in (get_clean_msgid(msg) for msg in ordered) if msgid]
+    root_msgid = get_clean_msgid(root)
+    if root_msgid and root_msgid in found:
+        found.remove(root_msgid)
+        found.insert(0, root_msgid)
+    return tuple(found)
 
 
 def _pick_root(msgs: Sequence[EmailMessage]) -> EmailMessage:
@@ -458,6 +587,7 @@ def summarize_thread(msgs: Sequence[EmailMessage]) -> ThreadSummary:
         msgid=get_clean_msgid(root) or '',
         subject=msg_get_subject(root),
         count=len(ordered),
+        msgids=_collect_msgids(root, ordered),
         first=min(dates) if dates else None,
         last=max(dates) if dates else None,
         is_patch_series=is_patch_series,

@@ -10,6 +10,7 @@ from conftest import MsgFactory
 
 from liblore.series import (
     ThreadSummary,
+    Trailer,
     extract_trailers,
     group_by_thread,
     parse_patch_subject,
@@ -21,6 +22,15 @@ from liblore.utils import msg_get_author, msg_get_inbody_author
 DATE1 = 'Mon, 15 Sep 2026 10:00:00 +0000'
 DATE2 = 'Mon, 15 Sep 2026 11:00:00 +0000'
 DATE3 = 'Mon, 15 Sep 2026 12:00:00 +0000'
+
+# What turns a body into a real patch: the basement line plus a diff.
+PATCH_TAIL = (
+    '---\n'
+    ' net/core.c | 2 +-\n'
+    ' 1 file changed, 1 insertion(+), 1 deletion(-)\n'
+    '--- a/net/core.c\n'
+    '+++ b/net/core.c\n'
+)
 
 
 class TestParsePatchSubject:
@@ -561,6 +571,124 @@ class TestSummarizeThread:
         assert summarize_thread(msgs).prefixes == ('RFC', 'net-next')
 
 
+class TestTrailerTypes:
+    """b4 sorts trailers into people, utilities and everything else."""
+
+    def _trailers(self, body: str, make_msg: MsgFactory) -> dict[str, Trailer]:
+        patch = make_msg(
+            subject='[PATCH 1/1] x',
+            msgid='tt1@x',
+            date=DATE1,
+            body=body + PATCH_TAIL,
+        )
+        return {t.key: t for t in summarize_thread([patch]).trailers}
+
+    def test_person_trailer_carries_the_address(self, make_msg: MsgFactory) -> None:
+        found = self._trailers('Signed-off-by: Alice <alice@example.com>\n', make_msg)
+        trailer = found['signed-off-by']
+        assert trailer.type == 'person'
+        assert trailer.is_person and not trailer.is_utility
+        assert trailer.addr == ('Alice', 'alice@example.com')
+
+    def test_stray_whitespace_in_address_is_normalised(
+        self, make_msg: MsgFactory
+    ) -> None:
+        found = self._trailers(
+            'Tested-by: Fuad Tabba < fuad.tabba@linux.dev>\n', make_msg
+        )
+        assert found['tested-by'].value == 'Fuad Tabba <fuad.tabba@linux.dev>'
+
+    def test_mailto_wrapper_is_stripped(self, make_msg: MsgFactory) -> None:
+        # Some clients round-trip through HTML and mangle the address.
+        found = self._trailers(
+            'Reviewed-by: Bob <bob@example.com> <mailto:bob@example.com>\n',
+            make_msg,
+        )
+        assert found['reviewed-by'].value == 'Bob <bob@example.com>'
+        assert found['reviewed-by'].addr == ('Bob', 'bob@example.com')
+
+    def test_known_utility_names_are_utilities(self, make_msg: MsgFactory) -> None:
+        found = self._trailers(
+            'Fixes: deadbeef1234 ("thing: do it")\n'
+            'Link: https://lore.kernel.org/r/foo@bar\n',
+            make_msg,
+        )
+        assert found['fixes'].type == 'utility'
+        assert found['link'].is_utility
+        assert found['link'].addr is None
+
+    def test_any_url_value_is_a_utility(self, make_msg: MsgFactory) -> None:
+        found = self._trailers('Suggested-by: https://example.com/x\n', make_msg)
+        assert found['suggested-by'].type == 'utility'
+
+    def test_addressless_trailer_stays_unknown(self, make_msg: MsgFactory) -> None:
+        found = self._trailers('Suggested-by: Somebody Nice\n', make_msg)
+        trailer = found['suggested-by']
+        assert trailer.type == 'unknown'
+        assert not trailer.is_person and not trailer.is_utility
+        assert trailer.addr is None
+
+    def test_summary_splits_people_from_utilities(self, make_msg: MsgFactory) -> None:
+        patch = make_msg(
+            subject='[PATCH 1/1] x',
+            msgid='ts1@x',
+            date=DATE1,
+            body='Fixes: deadbeef1234 ("thing: do it")\n'
+            'Signed-off-by: Alice <alice@example.com>\n'
+            'Suggested-by: Somebody Nice\n' + PATCH_TAIL,
+        )
+        summary = summarize_thread([patch])
+        assert [t.name for t in summary.person_trailers] == ['Signed-off-by']
+        assert [t.name for t in summary.utility_trailers] == ['Fixes']
+        # The unknown one is still in the full list, just in neither bucket.
+        assert len(summary.trailers) == 3
+
+
+class TestMsgids:
+    def test_msgids_are_in_date_order(self, make_msg: MsgFactory) -> None:
+        root = make_msg(subject='[PATCH 1/1] x', msgid='m1@x', date=DATE1)
+        late = make_msg(
+            subject='Re: [PATCH 1/1] x',
+            msgid='m3@x',
+            in_reply_to='m1@x',
+            date=DATE3,
+        )
+        early = make_msg(
+            subject='Re: [PATCH 1/1] x',
+            msgid='m2@x',
+            in_reply_to='m1@x',
+            date=DATE2,
+        )
+        summary = summarize_thread([late, root, early])
+        assert summary.msgids == ('m1@x', 'm2@x', 'm3@x')
+        assert len(summary.msgids) == summary.count
+        assert summary.msgids[0] == summary.msgid
+
+    def test_root_leads_even_when_it_is_not_the_oldest(
+        self, make_msg: MsgFactory
+    ) -> None:
+        # A cover letter can be stamped a second after its first patch.
+        cover = make_msg(subject='[PATCH 0/1] x', msgid='c0@x', date=DATE2)
+        patch = make_msg(
+            subject='[PATCH 1/1] x', msgid='c1@x', in_reply_to='c0@x', date=DATE1
+        )
+        summary = summarize_thread([cover, patch])
+        assert summary.msgids == ('c0@x', 'c1@x')
+        assert summary.msgids[0] == summary.msgid
+
+    def test_series_sent_in_the_same_second_keeps_its_order(
+        self, make_msg: MsgFactory
+    ) -> None:
+        # git send-email stamps a whole series within one second, so the
+        # n/m counter is what actually orders it.
+        msgs = [
+            make_msg(subject='[PATCH 3/3] c', msgid='s3@x', date=DATE1),
+            make_msg(subject='[PATCH 1/3] a', msgid='s1@x', date=DATE1),
+            make_msg(subject='[PATCH 2/3] b', msgid='s2@x', date=DATE1),
+        ]
+        assert summarize_thread(msgs).msgids == ('s1@x', 's2@x', 's3@x')
+
+
 class TestSerialization:
     def test_to_dict_is_json_safe(self, make_msg: MsgFactory) -> None:
         patch = make_msg(subject='[PATCH v2 1/1] x', msgid='j1@x', date=DATE1)
@@ -576,8 +704,14 @@ class TestSerialization:
         # Must survive a round trip through JSON unchanged.
         assert json.loads(json.dumps(payload)) == payload
         assert payload['trailers'] == [
-            {'name': 'Reviewed-by', 'value': 'Bob <bob@example.com>'}
+            {
+                'name': 'Reviewed-by',
+                'value': 'Bob <bob@example.com>',
+                'type': 'person',
+                'email': 'bob@example.com',
+            }
         ]
+        assert payload['msgids'] == ['j1@x', 'j2@x']
         assert payload['participants'][0] == {
             'name': 'Test User',
             'email': 'test@example.com',
