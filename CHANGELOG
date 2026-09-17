@@ -1,6 +1,27 @@
 CHANGELOG
 =========
 
+v0.10.0 (unreleased)
+--------------------
+- Add liblore.series for summarising a thread or patch series without
+  pulling in b4. summarize_thread() returns a ThreadSummary describing
+  the thread root, its participants, dates, patch series numbering and
+  completeness, the collected trailers, and a MessageSummary per
+  message. summarize_threads() and group_by_thread() split a flat query
+  result into threads.
+- Add Trailer, which records where a trailer came from and whether it
+  names a person. A person trailer in a reply counts only when the
+  sender signs it, as b4 requires. This is not a signature check.
+- Add email_matches(), name_matches() and Identity for deciding whether
+  two spellings are the same person.
+- Add parse_patch_subject() for reading a subject line on its own, and
+  ThreadSummary.to_dict() with SCHEMA_VERSION for JSON output.
+- Add utils helpers split_body_parts(), find_trailers(),
+  body_has_diff() and msg_get_inbody_author().
+- Prefer X-Original-From in msg_get_author(), so a message rewritten by
+  a mailing list reports the sender rather than the list. The header is
+  not authenticated; code that needs proof wants b4's attestation.
+
 v0.9.0 (2026-08-12)
 -------------------
 - Make cancellation operation-scoped. Every public entry point now runs
