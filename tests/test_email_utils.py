@@ -100,6 +100,22 @@ class TestMsgGetPayload:
         msg = EmailMessage(policy=emlpolicy)
         assert msg_get_payload(msg) == ''
 
+    def test_unknown_charset(self, make_msg: MsgFactory) -> None:
+        """``charset="yes"`` is a real thing posted to the lists, and
+        Python raises LookupError rather than returning replacement
+        characters: the codec name is what cannot be resolved, so
+        ``errors='replace'`` never gets a say."""
+        msg = make_msg(body='Body text.\n')
+        msg.set_param('charset', 'yes')
+        assert 'Body text.' in msg_get_payload(msg)
+
+    def test_unknown_charset_keeps_non_ascii(self, make_msg: MsgFactory) -> None:
+        """Falling back must still decode what it can, rather than
+        discarding the body or mangling every byte above ASCII."""
+        msg = make_msg(body='Ceci coûte cher.\n')
+        msg.set_param('charset', 'definitely-not-a-codec')
+        assert 'coûte' in msg_get_payload(msg)
+
 
 class TestMsgGetRecipients:
     def test_to_cc_from(self) -> None:

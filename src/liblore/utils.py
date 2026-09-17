@@ -411,7 +411,16 @@ def msg_get_payload(
     if not cs:
         cs = 'utf-8'
     if isinstance(bbody, bytes):
-        cpay = bbody.decode(cs, errors='replace')
+        try:
+            cpay = bbody.decode(cs, errors='replace')
+        except LookupError:
+            # A charset Python has no codec for: ``charset="yes"`` and
+            # friends do turn up on the lists.  ``errors='replace'`` is no
+            # help here, because it is the codec name that fails to
+            # resolve, before any byte is looked at.  Fall back to utf-8
+            # and hope for the best, the way b4 does for message bodies
+            # and :func:`clean_header` already does for headers.
+            cpay = bbody.decode('utf-8', errors='replace')
     else:
         cpay = str(bbody)
 
