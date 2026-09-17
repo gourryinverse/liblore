@@ -4,16 +4,19 @@
 from __future__ import annotations
 
 import json
+from email.message import EmailMessage
 
 import pytest
 from conftest import MsgFactory
 
 from liblore.series import (
+    SCHEMA_VERSION,
     ThreadSummary,
     Trailer,
     extract_trailers,
     group_by_thread,
     parse_patch_subject,
+    summarize_message,
     summarize_thread,
     summarize_threads,
 )
@@ -784,6 +787,50 @@ class TestMsgids:
         ]
         assert summarize_thread(msgs).msgids == ('s1@x', 's2@x', 's3@x')
 
+    def test_msgids_run_parallel_to_messages(self, make_msg: MsgFactory) -> None:
+        root = make_msg(subject='[PATCH 1/1] x', msgid='p1@x', date=DATE1)
+        reply = make_msg(
+            subject='Re: [PATCH 1/1] x',
+            msgid='p2@x',
+            in_reply_to='p1@x',
+            date=DATE2,
+        )
+        summary = summarize_thread([reply, root])
+        assert summary.msgids == tuple(m.msgid for m in summary.messages)
+
+    def test_a_message_with_no_msgid_keeps_its_place(
+        self, make_msg: MsgFactory
+    ) -> None:
+        # Every message counts, so msgids stays the same length as
+        # messages and holds an empty string where the id is missing.
+        root = make_msg(subject='[PATCH 1/1] x', msgid='n1@x', date=DATE1)
+        reply = make_msg(
+            subject='Re: [PATCH 1/1] x',
+            msgid='n2@x',
+            in_reply_to='n1@x',
+            date=DATE2,
+        )
+        del reply['Message-Id']
+        summary = summarize_thread([root, reply])
+        assert summary.count == 2
+        assert summary.msgids == ('n1@x', '')
+        assert summary.msgids == tuple(m.msgid for m in summary.messages)
+
+    def test_a_root_with_no_msgid_still_leads(self, make_msg: MsgFactory) -> None:
+        root = make_msg(subject='[PATCH 1/1] x', msgid='r1@x', date=DATE1)
+        reply = make_msg(
+            subject='Re: [PATCH 1/1] x',
+            msgid='r2@x',
+            in_reply_to='r1@x',
+            date=DATE2,
+        )
+        del root['Message-Id']
+        summary = summarize_thread([root, reply])
+        assert summary.msgid == ''
+        assert summary.msgids == ('', 'r2@x')
+        assert summary.messages[0].subject == '[PATCH 1/1] x'
+        assert summary.msgids == tuple(m.msgid for m in summary.messages)
+
 
 class TestSerialization:
     def test_to_dict_is_json_safe(self, make_msg: MsgFactory) -> None:
@@ -805,9 +852,17 @@ class TestSerialization:
                 'value': 'Bob <bob@example.com>',
                 'type': 'person',
                 'email': 'bob@example.com',
+                'msgid': 'j2@x',
+                'date': '2026-09-15T11:00:00+00:00',
             }
         ]
         assert payload['msgids'] == ['j1@x', 'j2@x']
+        assert payload['schema'] == SCHEMA_VERSION
+        assert payload['author'] == {
+            'name': 'Test User',
+            'email': 'test@example.com',
+        }
+        assert [m['msgid'] for m in payload['messages']] == ['j1@x', 'j2@x']
         assert payload['participants'][0] == {
             'name': 'Test User',
             'email': 'test@example.com',
@@ -821,9 +876,19 @@ class TestSerialization:
             [make_msg(subject='[PATCH 1/1] x', msgid='k2@x', date=DATE1)]
         ).to_dict()
         assert plain.keys() == patched.keys()
+        # Every field is serialised, plus the schema version, which is a
+        # property of the shape rather than of any one summary.
         assert set(plain) == {
             f.name for f in ThreadSummary.__dataclass_fields__.values()
-        }
+        } | {'schema'}
+
+    def test_message_key_set_is_fixed(self, make_msg: MsgFactory) -> None:
+        plain = summarize_message(make_msg(msgid='km1@x'))
+        patched = summarize_message(
+            make_msg(subject='[PATCH v2 2/3] x', msgid='km2@x', date=DATE1)
+        )
+        assert plain.to_dict().keys() == patched.to_dict().keys()
+        assert json.loads(json.dumps(patched.to_dict())) == patched.to_dict()
 
 
 class TestSummarizeThreads:
@@ -861,3 +926,230 @@ class TestSummarizeThreads:
             and bool(wanted & s.trailer_names)
         ]
         assert [s.msgid for s in hits] == ['g1@x']
+
+
+ME = ('Me Maintainer', 'me@example.com')
+SASHIKO = ('Sashiko Tanaka', 'sashiko@example.com')
+ANN = ('Ann Submitter', 'ann@example.com')
+
+
+class TestMessageSummaries:
+    def test_messages_match_msgids_root_first(self, make_msg: MsgFactory) -> None:
+        # The cover letter is stamped a second after patch 1/2, so date
+        # order and thread order genuinely differ here.
+        cover = make_msg(subject='[PATCH 0/2] set', msgid='c0@x', date=DATE2)
+        one = make_msg(
+            subject='[PATCH 1/2] a', msgid='c1@x', in_reply_to='c0@x', date=DATE1
+        )
+        summary = summarize_thread([one, cover])
+        assert summary.msgids == ('c0@x', 'c1@x')
+        assert [m.msgid for m in summary.messages] == list(summary.msgids)
+        assert summary.messages[0].patch.is_cover is True
+
+    def test_message_carries_author_date_and_patch(self, make_msg: MsgFactory) -> None:
+        msg = make_msg(
+            subject='[PATCH v3 2/5] thing',
+            from_addr=ANN,
+            msgid='m1@x',
+            date=DATE1,
+            body='Body\n' + PATCH_TAIL,
+        )
+        summary = summarize_message(msg)
+        assert summary.author == ANN
+        assert summary.date is not None
+        assert summary.has_diff is True
+        assert summary.is_submission is True
+        assert (summary.patch.version, summary.patch.counter) == (3, 2)
+
+    def test_reply_carrying_brackets_is_not_a_submission(
+        self, make_msg: MsgFactory
+    ) -> None:
+        reply = make_msg(subject='Re: [PATCH 1/1] a', msgid='r1@x', date=DATE2)
+        assert summarize_message(reply).is_submission is False
+
+    def test_trailer_records_the_message_that_offered_it(
+        self, make_msg: MsgFactory
+    ) -> None:
+        patch = make_msg(
+            subject='[PATCH 1/1] a', from_addr=ANN, msgid='p1@x', date=DATE1
+        )
+        review = make_msg(
+            subject='Re: [PATCH 1/1] a',
+            from_addr=SASHIKO,
+            msgid='p2@x',
+            in_reply_to='p1@x',
+            date=DATE2,
+            body='Reviewed-by: Sashiko Tanaka <sashiko@example.com>\n',
+        )
+        summary = summarize_thread([patch, review])
+        (trailer,) = [t for t in summary.trailers if t.key == 'reviewed-by']
+        assert trailer.msgid == 'p2@x'
+        assert trailer.date is not None
+        # And the same trailer is on the message that made it.
+        offered = summary.messages_by('sashiko@example.com')
+        assert [t.key for t in offered[0].trailers] == ['reviewed-by']
+
+
+class TestAuthorAndRepliers:
+    def test_author_is_the_thread_root(self, make_msg: MsgFactory) -> None:
+        patch = make_msg(
+            subject='[PATCH 1/1] a', from_addr=ANN, msgid='a1@x', date=DATE1
+        )
+        reply = make_msg(
+            subject='Re: [PATCH 1/1] a',
+            from_addr=SASHIKO,
+            msgid='a2@x',
+            in_reply_to='a1@x',
+            date=DATE2,
+        )
+        summary = summarize_thread([patch, reply])
+        assert summary.author == ANN
+        assert summary.repliers == (SASHIKO,)
+
+    def test_author_answering_their_own_thread_is_not_a_replier(
+        self, make_msg: MsgFactory
+    ) -> None:
+        # The whole point of keeping author apart from participants: Ann
+        # is in participants twice over and still has replied to nobody.
+        patch = make_msg(
+            subject='[PATCH 1/1] a', from_addr=ANN, msgid='b1@x', date=DATE1
+        )
+        followup = make_msg(
+            subject='Re: [PATCH 1/1] a',
+            from_addr=ANN,
+            msgid='b2@x',
+            in_reply_to='b1@x',
+            date=DATE2,
+        )
+        summary = summarize_thread([patch, followup])
+        assert summary.participants == (ANN,)
+        assert summary.repliers == ()
+
+    def test_messages_by_is_exact_and_case_insensitive(
+        self, make_msg: MsgFactory
+    ) -> None:
+        patch = make_msg(
+            subject='[PATCH 1/1] a', from_addr=ANN, msgid='d1@x', date=DATE1
+        )
+        reply = make_msg(
+            subject='Re: [PATCH 1/1] a',
+            from_addr=('Ann Submitter', 'ANN@example.com'),
+            msgid='d2@x',
+            in_reply_to='d1@x',
+            date=DATE2,
+        )
+        summary = summarize_thread([patch, reply])
+        assert len(summary.messages_by('ann@EXAMPLE.com')) == 2
+        assert summary.messages_by('ann@elsewhere.org') == ()
+
+
+def _reviewed_by_awaiting_reply(
+    summaries: list[ThreadSummary], reviewer: str, me: str
+) -> list[str]:
+    """The example query, written the way a caller would write it.
+
+    "Threads reviewed by *reviewer* that have not yet had a reply from
+    *me*" -- meaning I have sent nothing in the thread since the review
+    landed.  Every judgement here is the caller's; the module only
+    supplies the facts it leans on.
+    """
+    hits: list[str] = []
+    for summary in summaries:
+        reviews = [
+            trailer.date
+            for trailer in summary.person_trailers
+            if trailer.key == 'reviewed-by'
+            and trailer.addr
+            and trailer.addr[1].lower() == reviewer.lower()
+            and trailer.date is not None
+        ]
+        if not reviews:
+            continue
+        latest = max(reviews)
+        mine = summary.messages_by(me)
+        if any(m.date is not None and m.date > latest for m in mine):
+            continue
+        hits.append(summary.msgid)
+    return hits
+
+
+class TestReviewedAwaitingReplyQuery:
+    def _corpus(self, make_msg: MsgFactory) -> list[ThreadSummary]:
+        def review(msgid: str, parent: str) -> EmailMessage:
+            return make_msg(
+                subject=f'Re: [PATCH 1/1] {parent}',
+                from_addr=SASHIKO,
+                msgid=msgid,
+                in_reply_to=parent,
+                date=DATE2,
+                body='Reviewed-by: Sashiko Tanaka <sashiko@example.com>\n',
+            )
+
+        msgs = [
+            # Reviewed, no reply from me -- the answer.
+            make_msg(subject='[PATCH 1/1] t1', from_addr=ANN, msgid='t1', date=DATE1),
+            review('t1r', 't1'),
+            # Reviewed, and I answered afterwards.
+            make_msg(subject='[PATCH 1/1] t2', from_addr=ANN, msgid='t2', date=DATE1),
+            review('t2r', 't2'),
+            make_msg(
+                subject='Re: [PATCH 1/1] t2',
+                from_addr=ME,
+                msgid='t2m',
+                in_reply_to='t2',
+                date=DATE3,
+                body='Applied, thanks.\n',
+            ),
+            # My own series, reviewed, not answered by me since.
+            make_msg(subject='[PATCH 1/1] t3', from_addr=ME, msgid='t3', date=DATE1),
+            review('t3r', 't3'),
+            # Reviewed by somebody else entirely.
+            make_msg(subject='[PATCH 1/1] t4', from_addr=ANN, msgid='t4', date=DATE1),
+            make_msg(
+                subject='Re: [PATCH 1/1] t4',
+                from_addr=('Bob Other', 'bob@example.com'),
+                msgid='t4r',
+                in_reply_to='t4',
+                date=DATE2,
+                body='Reviewed-by: Bob Other <bob@example.com>\n',
+            ),
+        ]
+        return summarize_threads(msgs)
+
+    def test_finds_only_the_unanswered_reviewed_threads(
+        self, make_msg: MsgFactory
+    ) -> None:
+        hits = _reviewed_by_awaiting_reply(
+            self._corpus(make_msg), 'sashiko@example.com', 'me@example.com'
+        )
+        # t2 is answered; t4 is not Sashiko's.  t3 is mine and I have
+        # still not replied to the review, which is why being in
+        # participants cannot stand in for having replied.
+        assert sorted(hits) == ['t1', 't3']
+
+    def test_a_reply_before_the_review_does_not_count(
+        self, make_msg: MsgFactory
+    ) -> None:
+        msgs = [
+            make_msg(subject='[PATCH 1/1] e1', from_addr=ANN, msgid='e1', date=DATE1),
+            make_msg(
+                subject='Re: [PATCH 1/1] e1',
+                from_addr=ME,
+                msgid='e1m',
+                in_reply_to='e1',
+                date=DATE2,
+                body='Looks reasonable.\n',
+            ),
+            make_msg(
+                subject='Re: [PATCH 1/1] e1',
+                from_addr=SASHIKO,
+                msgid='e1r',
+                in_reply_to='e1',
+                date=DATE3,
+                body='Reviewed-by: Sashiko Tanaka <sashiko@example.com>\n',
+            ),
+        ]
+        hits = _reviewed_by_awaiting_reply(
+            summarize_threads(msgs), 'sashiko@example.com', 'me@example.com'
+        )
+        assert hits == ['e1']
