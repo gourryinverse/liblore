@@ -2,8 +2,8 @@
 
 A Python library for working with [public-inbox](https://public-inbox.org/)
 servers, particularly [lore.kernel.org](https://lore.kernel.org/). It fetches
-email threads, parses mbox files, and provides utilities for working with
-email messages from mailing list archives.
+email threads, parses mbox files, summarises patch series, and provides
+utilities for working with email messages from mailing list archives.
 
 ## Requirements
 
@@ -479,6 +479,218 @@ deduplication? Use `get_thread_by_query`. Want the full convenience of
 strict filtering and date sorting? Use `get_thread_by_msgid`. Need to
 poll for new messages? Use `get_thread_updates_since`.
 
+### Thread and Series Summaries
+
+The `liblore.series` module answers one question: *what is in this thread?*
+It is pure Python -- no network, no git, no subprocess -- so you hand it the
+messages you already fetched and get back plain dataclasses you can filter,
+cache or turn into JSON.
+
+It reports facts and leaves the judgements to you. Whether a series arrived
+complete, whether you have already applied it, whether two addresses belong
+to the same human -- those are your calls. The summary gives you what you
+need to make them.
+
+```python
+from liblore import LoreNode
+from liblore.series import summarize_thread
+
+with LoreNode() as node:
+    msgs = node.get_thread_by_msgid('20250101-example@kernel.org')
+
+summary = summarize_thread(msgs)
+
+print(summary.subject)  # subject of the thread root
+print(summary.count)  # how many messages are in the thread
+print(summary.first, summary.last)  # oldest and newest timestamps
+print(summary.is_patch_series)  # did anything carry a [PATCH ...] subject
+print(summary.patch_count)  # how many patches were actually seen
+print(summary.expected)  # how many the brackets claimed (the m in n/m)
+print(summary.version)  # 3 for a [PATCH v3] series, 1 if unstated
+print(summary.has_cover)  # was there a 0/m cover letter
+print(summary.prefixes)  # extra brackets, e.g. ('RFC', 'net-next')
+print(summary.author)  # who opened the thread, as (name, email)
+print(summary.participants)  # everybody who sent something, author included
+print(summary.repliers)  # everybody except the author
+```
+
+`patch_count` and `expected` are deliberately two fields. Comparing them is
+how *you* decide whether a series arrived complete -- liblore will not
+decide it for you, because "complete" means different things depending on
+what you are about to do.
+
+A lone patch with no `n/m` counter counts as a one-patch series. The
+`[PATCH` bracket is what makes something a patch here, which is the same
+rule b4 uses; a message carrying a diff under some other subject is not
+treated as a submission.
+
+#### Messages in Order
+
+`messages` holds the same thread message by message, so you can ask
+questions about *order* -- did the review land before or after the last
+reply, which patch in the series was tagged, has this person said anything
+since.
+
+```python
+for msg in summary.messages:
+    print(msg.msgid, msg.author, msg.date)
+    print(msg.patch.counter, 'of', msg.patch.expected)  # parsed subject
+    print(msg.has_diff)  # did this message carry a diff
+    print(msg.trailers)  # trailers this message offered
+    print(msg.is_submission)  # a patch, and not a reply carrying its brackets
+```
+
+The thread root comes first and the rest follow oldest-first. Messages sent
+within the same second -- which is every series sent by `git send-email` --
+are ordered by their `n/m` counter rather than left in arrival order.
+
+`msgids` runs parallel to `messages`: `msgids[i]` is always
+`messages[i].msgid`, and both are `count` entries long. A message with no
+Message-Id keeps its place as an empty string, so the two never drift apart.
+
+```python
+assert summary.msgids == tuple(m.msgid for m in summary.messages)
+assert summary.msgids[0] == summary.msgid  # the thread root leads
+```
+
+You can also summarise a single message on its own:
+
+```python
+from liblore.series import summarize_message
+
+one = summarize_message(msg)
+```
+
+#### Trailers
+
+Every trailer seen anywhere in the thread is reported once, in the order it
+first appeared, classified the way b4 classifies them:
+
+```python
+for trailer in summary.trailers:
+    print(trailer.name)  # 'Reviewed-by', as written
+    print(trailer.key)  # 'reviewed-by', for comparing
+    print(trailer.value)  # 'Ann Submitter <ann@example.com>'
+    print(trailer.type)  # 'person', 'utility' or 'unknown'
+    print(trailer.addr)  # ('Ann Submitter', 'ann@example.com'), or None
+    print(trailer.msgid)  # which message offered it first
+    print(trailer.date)  # and when
+
+summary.person_trailers  # endorsements: Reviewed-by, Acked-by, Tested-by ...
+summary.utility_trailers  # bookkeeping: Fixes, Link, Closes ...
+summary.trailer_names  # frozenset of every lowercased name seen
+```
+
+A reply's endorsement counts only if the sender signs it themselves: you may
+tag on your own behalf, not on somebody else's. This is b4's rule, and it
+keeps a quoted tag or a pasted device-tree snippet from being read as a
+review. Patches are not subject to it -- a patch collects everybody's tags,
+and the person sending it signs for them.
+
+This is **not** a signature check. liblore does no DKIM by design, so a
+trailer is reported as *claiming* to come from the person it names. If you
+need proof, that is what b4's attestation is for.
+
+#### Asking About People
+
+Two spellings of one address are recognised -- an extended local part, and a
+domain one label deeper -- which covers most of what a mailing list does to
+an address:
+
+```python
+from liblore.series import email_matches, name_matches
+
+email_matches('ann+kernel@example.com', 'ann@example.com')  # True
+email_matches('ann@linux.intel.com', 'ann@intel.com')  # True
+name_matches('Amara Okonkwo', 'Okonkwo, Amara')  # True
+name_matches('Bob Reviewer (Arm)', 'Bob Reviewer')  # True
+```
+
+Knowing that two *unrelated* addresses belong to one person needs a
+directory -- a MAINTAINERS file, a config entry, a mapping you keep
+yourself -- so `Identity` is where you hand that in:
+
+```python
+from liblore.series import Identity
+
+me = Identity(
+    addrs=('ann@example.com', 'ann@corp.example.net'),
+    names=('Ann Submitter',),
+)
+
+summary.messages_by(me)  # every message this person sent
+summary.trailers_by(me)  # every trailer attributed to them
+me.matches('ann@example.com')  # True
+```
+
+`messages_by()` and `trailers_by()` also take a bare address or a
+`(name, email)` pair, in which case only that spelling is matched.
+
+`participants` stays literal: one entry per distinct From address, so
+somebody who wrote from two addresses appears twice. That is what the thread
+contains, and collapsing them is your decision, not ours.
+
+#### Many Threads at Once
+
+A search result is a flat bag of messages from many threads.
+`summarize_threads()` splits it up and summarises each one:
+
+```python
+from liblore.series import summarize_threads
+
+with LoreNode() as node:
+    msgs = node.get_thread_by_query('s:"net: fix"', months=1)
+
+for summary in summarize_threads(msgs):
+    print(summary.subject, summary.count)
+```
+
+Grouping walks the In-Reply-To and References headers, so a thread is found
+even when its root is missing from the result. If you want the groups
+without the summaries, use `group_by_thread()`, which returns a list of
+message lists.
+
+#### JSON
+
+Both summaries serialise to plain JSON-safe dictionaries, stamped with a
+schema version so stored records can be read back later:
+
+```python
+import json
+from liblore.series import SCHEMA_VERSION
+
+print(json.dumps(summary.to_dict(), indent=2))
+print(SCHEMA_VERSION)
+```
+
+Timestamps come out as ISO 8601 strings, and the key set is fixed: a field
+with nothing in it is present and empty rather than missing.
+
+#### Parsing a Subject on Its Own
+
+If all you have is a subject line, `parse_patch_subject()` decomposes the
+brackets:
+
+```python
+from liblore.series import parse_patch_subject
+
+parsed = parse_patch_subject('[PATCH RFC v3 2/5] net: fix the thing')
+parsed.title  # 'net: fix the thing'
+parsed.version  # 3
+parsed.counter  # 2
+parsed.expected  # 5
+parsed.prefixes  # ('RFC',)
+parsed.is_patch  # True
+parsed.is_cover  # False -- 0/5 would be True
+parsed.is_reply  # True for a 'Re:' subject
+parsed.version_inferred  # False here: the subject said v3
+parsed.counters_inferred  # False here: the subject said 2/5
+```
+
+The `*_inferred` flags let you tell a stated `1/1` from an assumed one,
+which matters when a lone patch and a one-patch series need handling
+differently.
+
 ### Utility Functions
 
 The `liblore.utils` module provides lower-level helpers for parsing and
@@ -512,6 +724,7 @@ msg = parse_message(raw_bytes)
 from liblore.utils import (
     msg_get_subject,
     msg_get_author,
+    msg_get_inbody_author,
     msg_get_payload,
     msg_get_recipients,
 )
@@ -525,15 +738,64 @@ bare = msg_get_subject(msg, strip_prefixes=True)
 # Get the author as a (name, email) tuple
 name, addr = msg_get_author(msg)
 
+# Lists that rewrite From to survive DMARC keep the original sender in
+# X-Original-From, which is preferred over the rewritten header -- so
+# this reports the person, not the mailing list.  Note that the header
+# is unauthenticated: it says who a message claims to be from.
+
+# Prefer a git-style in-body "From:" line, which is what git am would
+# record as the author of a patch sent on somebody else's behalf
+name, addr = msg_get_author(msg, use_inbody=True)
+
+# Or read that in-body header on its own; None if the message has none
+author = msg_get_inbody_author(msg)
+
 # Get the plain-text body, stripping the signature
 body = msg_get_payload(msg)
 
 # Get the body without quoted lines or signature
 body = msg_get_payload(msg, strip_quoted=True, strip_signature=True)
 
-# Get all recipient email addresses (To + Cc + From)
+# Get all recipient addresses (To + Cc + From), as a lowercased set
 recipients = msg_get_recipients(msg)
 ```
+
+#### Patch Bodies and Trailers
+
+A patch body has structure: in-body git headers at the top, the commit
+message, a trailing block of `Name: value` trailers, then everything below
+the `---` separator. `split_body_parts()` takes it apart, and both it and
+`find_trailers()` are ports of b4's logic, so the corner cases b4 has
+learned about are handled the same way.
+
+```python
+from liblore.utils import body_has_diff, find_trailers, split_body_parts
+
+# Is this a patch or just a reply?
+body_has_diff(body)
+
+parts = split_body_parts(body)
+parts.githeaders  # [('From', 'Ann Submitter <ann@example.com>'), ...]
+parts.message  # the commit message, without the headers or trailers
+parts.trailers  # [('Signed-off-by', 'Ann Submitter <ann@example.com>')]
+parts.basement  # everything below the '---': diffstat and diff
+parts.signature  # text below a conformant '-- ' marker
+
+# Scan any block of text for trailers.  Returns the trailers it found and
+# the lines it could not read as one.
+trailers, others = find_trailers(text)
+
+# In followup mode the rules are stricter, for scanning a reply that has
+# no patch structure to lean on
+trailers, others = find_trailers(reply_body, followup=True)
+```
+
+Trailers may be indented, since some maintainers send them that way, but one
+behind a `>` quoting marker is somebody else's and does not count.
+
+For most purposes you want `liblore.series` instead, which uses these and
+gives you classified `Trailer` objects with the sender check already
+applied.
 
 #### Email Serialization
 
