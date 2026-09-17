@@ -19,6 +19,12 @@ trailers that message offered.  Aggregate questions ("who reviewed
 this?") are answered from the thread's own fields; ordered ones ("did
 my reply arrive after that review?") need the per-message records,
 which is why both are reported and not just the aggregates.
+
+Questions about people go through :class:`Identity`, so that every
+caller answers "is this the same person?" the same way.  Knowing that
+two unrelated addresses belong to one human needs a directory, which is
+the caller's to supply; what this module knows on its own is documented
+on :func:`email_matches` and :func:`name_matches`.
 """
 
 from __future__ import annotations
@@ -106,6 +112,13 @@ _RE_HAS_ADDR = re.compile(r'\S+@\S+\.\S+')
 # An extended local part, as in foo+kernel@example.com.
 _RE_EXTENDED_LOCAL = re.compile(r'\+[^@]+@')
 
+# One word of a display name, punctuation and spacing left out.
+_RE_NAME_WORD = re.compile(r'\w+')
+
+# An aside in a display name, as in "Bob Reviewer (Arm)" -- usually the
+# employer, sometimes a nickname, never part of the name itself.
+_RE_NAME_ASIDE = re.compile(r'\([^)]*\)')
+
 # Patch and commit metadata that is not review feedback.  A reply that
 # quotes a patch's own headers should not be read as having offered
 # them, so these are dropped from replies (b4 does the same).
@@ -129,6 +142,157 @@ _REPLY_IGNORES = frozenset(
 def _isoformat(when: datetime.datetime | None) -> str | None:
     """Render a timestamp for JSON, passing ``None`` straight through."""
     return when.isoformat() if when is not None else None
+
+
+def email_matches(one: str, two: str) -> bool:
+    """Whether two addresses name the same mailbox.
+
+    Beyond a case-insensitive comparison this forgives the two ways one
+    mailbox routinely appears under two spellings on a mailing list: an
+    extended local part, so ``foo+kernel@example.com`` matches
+    ``foo@example.com``, and a domain that is one label deeper than the
+    other, so ``foo@linux.intel.com`` matches ``foo@intel.com``.
+
+    It does not attempt to know that two genuinely different addresses
+    belong to one person -- that needs a directory, which is a caller's
+    to supply.  :class:`Identity` is how to hand one in.
+    """
+    one, two = one.lower(), two.lower()
+    if one == two:
+        return True
+    if '@' not in one or '@' not in two:
+        return False
+    one = _RE_EXTENDED_LOCAL.sub('@', one)
+    two = _RE_EXTENDED_LOCAL.sub('@', two)
+    if one == two:
+        return True
+    olocal, odomain = one.split('@', maxsplit=1)
+    tlocal, tdomain = two.split('@', maxsplit=1)
+    if olocal != tlocal:
+        return False
+    return abs(odomain.count('.') - tdomain.count('.')) == 1 and (
+        odomain.endswith(f'.{tdomain}') or tdomain.endswith(f'.{odomain}')
+    )
+
+
+def _clean_name(name: str) -> str:
+    """Lowercase a display name and drop anything in parentheses.
+
+    Kernel mail routinely carries the sender's employer in the From
+    line -- "Bob Reviewer (Arm)" -- while the tag they sign is written
+    plainly, or the other way round.  The aside is not part of anybody's
+    name, so it plays no part in comparing two of them.
+    """
+    return ' '.join(_RE_NAME_ASIDE.sub(' ', name).lower().split())
+
+
+def _name_parts_match(whole: str, listed: str) -> bool:
+    """Whether *listed*, written "Surname, Given", names *whole*'s person.
+
+    Every word of *listed* has to be a whole word of *whole*, so
+    "Okonkwo, Amara" matches "Amara Okonkwo" but "Smith, Alex" does not
+    match "Alexander Smithson".  Extra words on the *whole* side are
+    fine: a middle name or an initial does not stop the match.
+    """
+    chunks = [chunk.strip() for chunk in listed.split(',') if chunk.strip()]
+    if len(chunks) < 2:
+        return False
+    words = _RE_NAME_WORD.findall(listed)
+    if not words:
+        return False
+    return set(words) <= set(_RE_NAME_WORD.findall(whole))
+
+
+def name_matches(one: str, two: str) -> bool:
+    """Whether two display names are the same person's, as far as we can tell.
+
+    Case and surrounding space are ignored, an aside in parentheses is
+    dropped so "Bob Reviewer (Arm)" is still Bob Reviewer, and a name
+    written "Okonkwo, Amara" matches the same name written out
+    straight.  Unlike the comparison b4 makes internally, this is
+    symmetric: it does not matter which of the two is the
+    comma-separated one.
+
+    Two people who share a name are indistinguishable here, so this is a
+    weaker signal than :func:`email_matches` and should not be the only
+    thing a decision rests on.  An empty name matches nothing, not even
+    another empty one.
+    """
+    one, two = _clean_name(one), _clean_name(two)
+    if not one or not two:
+        return False
+    if one == two:
+        return True
+    return _name_parts_match(one, two) or _name_parts_match(two, one)
+
+
+@dataclass(frozen=True)
+class Identity:
+    """One person, and the names and addresses they are known by.
+
+    Everything in this module that asks "is this the same person?" has
+    to answer it the same way, or two callers looking at one thread will
+    disagree about who reviewed it.  This is that one way, and it is the
+    seam where a caller's own knowledge goes: liblore can tell that
+    ``foo+list@example.com`` and ``foo@example.com`` are one mailbox, but
+    only a directory -- a MAINTAINERS file, a config entry, a mapping the
+    maintainer wrote by hand -- knows that two unrelated addresses belong
+    to one human.  Build an Identity from what that directory says.
+
+    A match on any one address or any one name is a match.  Address
+    matching is the strong signal; see :func:`name_matches` for why the
+    name half is weaker.
+    """
+
+    addrs: tuple[str, ...] = ()
+    names: tuple[str, ...] = ()
+
+    @classmethod
+    def from_addr(cls, addr: tuple[str, str]) -> Identity:
+        """Build an identity from one parsed ``(name, email)`` pair."""
+        name, email_addr = addr
+        return cls(
+            addrs=(email_addr,) if email_addr else (),
+            names=(name,) if name else (),
+        )
+
+    def matches_addr(self, addr: str) -> bool:
+        """Whether *addr* is one of this person's mailboxes."""
+        return any(email_matches(addr, known) for known in self.addrs)
+
+    def matches_name(self, name: str) -> bool:
+        """Whether *name* is one of the names this person goes by."""
+        return any(name_matches(name, known) for known in self.names)
+
+    def matches(self, who: str | tuple[str, str] | Identity) -> bool:
+        """Whether *who* is this person.
+
+        Accepts a bare address, a parsed ``(name, email)`` pair, or
+        another identity.  A pair matches on either half, so a
+        participant whose address we have never seen is still recognised
+        by name -- and vice versa, which is the usual case.
+        """
+        if isinstance(who, Identity):
+            return any(self.matches_addr(a) for a in who.addrs) or any(
+                self.matches_name(n) for n in who.names
+            )
+        if isinstance(who, str):
+            return self.matches_addr(who)
+        name, addr = who
+        return self.matches_addr(addr) or self.matches_name(name)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serialisable view of this identity."""
+        return {'addrs': list(self.addrs), 'names': list(self.names)}
+
+
+def _as_identity(who: str | tuple[str, str] | Identity) -> Identity:
+    """Coerce the several ways of naming a person into an Identity."""
+    if isinstance(who, Identity):
+        return who
+    if isinstance(who, str):
+        return Identity(addrs=(who,))
+    return Identity.from_addr(who)
 
 
 @dataclass(frozen=True)
@@ -315,6 +479,11 @@ class ThreadSummary:
     not that you answered anybody, and for the person who posted the
     series in the first place those are very different claims.
 
+    ``participants`` is literal: it holds one entry per distinct From
+    address, so somebody who wrote from two addresses appears twice.
+    That is what the thread contains, and deciding that two addresses
+    are one person is the caller's to do -- see :class:`Identity`.
+
     ``messages`` holds the same thread message by message, in the order
     of ``msgids``.  The aggregate fields are all derivable from it and
     are kept because they are what most callers actually want.
@@ -356,30 +525,46 @@ class ThreadSummary:
     def repliers(self) -> tuple[tuple[str, str], ...]:
         """Participants other than the author, in the order they spoke.
 
-        The author is dropped by address, so somebody who posted the
-        series and then answered a review is still not counted as
-        having replied to it -- they are the thread's author either
-        way.  Which of the remaining people count as a real answer is,
-        as ever, the caller's call.
+        The author is dropped however they spelled themselves, so
+        somebody who posted the series from one address and answered a
+        review from another is still not counted as having replied to
+        it -- they are the thread's author either way.  Which of the
+        remaining people count as a real answer is, as ever, the
+        caller's call.
         """
         if self.author is None:
             return self.participants
+        person = Identity.from_addr(self.author)
+        return tuple(other for other in self.participants if not person.matches(other))
+
+    def messages_by(
+        self, who: str | tuple[str, str] | Identity
+    ) -> tuple[MessageSummary, ...]:
+        """Messages sent by *who*, in thread order.
+
+        *who* may be a bare address, a parsed ``(name, email)`` pair or
+        an :class:`Identity`.  A bare address is compared as an address
+        only, so pass an Identity when one person's several unrelated
+        addresses have to count as one.
+        """
+        person = _as_identity(who)
         return tuple(
-            person
-            for person in self.participants
-            if person[1].lower() != self.author[1].lower()
+            message for message in self.messages if person.matches(message.author)
         )
 
-    def messages_by(self, addr: str) -> tuple[MessageSummary, ...]:
-        """Messages sent from *addr*, in thread order.
+    def trailers_by(self, who: str | tuple[str, str] | Identity) -> tuple[Trailer, ...]:
+        """Trailers naming *who*, in the order they were first offered.
 
-        Matched on the address alone, case-insensitively, and exactly:
-        resolving one person's several addresses to one identity needs a
-        directory this module does not have and should not guess at.
+        These are the endorsements attributed *to* that person, which is
+        not the same as the trailers carried by messages they sent: a
+        submitter collects a reviewer's tag into the next revision, and
+        the tag is still the reviewer's.
         """
-        wanted = addr.lower()
+        person = _as_identity(who)
         return tuple(
-            message for message in self.messages if message.author[1].lower() == wanted
+            trailer
+            for trailer in self.trailers
+            if trailer.addr is not None and person.matches(trailer.addr)
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -504,45 +689,6 @@ def parse_patch_subject(subject: str) -> PatchSubject:
     )
 
 
-def _email_eq(one: str, two: str) -> bool:
-    """Whether two addresses name the same mailbox, as b4 compares them."""
-    one, two = one.lower(), two.lower()
-    if one == two:
-        return True
-    if '@' not in one or '@' not in two:
-        return False
-    # An extended local part is still the same mailbox, so
-    # foo+kernel@example.com matches foo@example.com.
-    one = _RE_EXTENDED_LOCAL.sub('@', one)
-    two = _RE_EXTENDED_LOCAL.sub('@', two)
-    if one == two:
-        return True
-    # One domain may be a subdomain of the other, which covers the
-    # foo@linux.intel.com and foo@intel.com pairing.
-    olocal, odomain = one.split('@', maxsplit=1)
-    tlocal, tdomain = two.split('@', maxsplit=1)
-    if olocal != tlocal:
-        return False
-    return abs(odomain.count('.') - tdomain.count('.')) == 1 and (
-        odomain.endswith(f'.{tdomain}') or tdomain.endswith(f'.{odomain}')
-    )
-
-
-def _name_eq(tname: str, fromname: str) -> bool:
-    """Whether a trailer's name is the same name as the sender's."""
-    tname, fromname = tname.lower().strip(), fromname.lower().strip()
-    if not tname or not fromname:
-        return False
-    if tname == fromname:
-        return True
-    # A From: written "Okonkwo, Amara" still matches a trailer
-    # signed "Amara Okonkwo".
-    chunks = [chunk.strip() for chunk in fromname.split(',') if chunk.strip()]
-    if len(chunks) < 2:
-        return False
-    return all(chunk in tname for chunk in chunks)
-
-
 def _is_self_attested(trailer: Trailer, author: tuple[str, str]) -> bool:
     """Whether a reply's person trailer was offered by the sender.
 
@@ -553,7 +699,7 @@ def _is_self_attested(trailer: Trailer, author: tuple[str, str]) -> bool:
     """
     if trailer.addr is None:
         return True
-    return _email_eq(trailer.addr[1], author[1]) or _name_eq(trailer.addr[0], author[0])
+    return Identity.from_addr(author).matches(trailer.addr)
 
 
 def extract_trailers(msg: EmailMessage) -> list[Trailer]:

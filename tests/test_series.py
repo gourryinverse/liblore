@@ -11,10 +11,13 @@ from conftest import MsgFactory
 
 from liblore.series import (
     SCHEMA_VERSION,
+    Identity,
     ThreadSummary,
     Trailer,
+    email_matches,
     extract_trailers,
     group_by_thread,
+    name_matches,
     parse_patch_subject,
     summarize_message,
     summarize_thread,
@@ -386,6 +389,17 @@ class TestSelfAttestedTrailers:
             == []
         )
 
+    def test_an_affiliation_does_not_break_attestation(
+        self, make_msg: MsgFactory
+    ) -> None:
+        # The name carries the employer and the address is unrelated to
+        # the one in the tag, so only the name can rescue this.
+        assert self._names(
+            ('Bob Reviewer (Arm)', 'bob@example.arm.com'),
+            'lgtm\n\nReviewed-by: Bob Reviewer <bob@unrelated.example.org>\n',
+            make_msg,
+        ) == ['Reviewed-by']
+
     def test_pasted_snippet_is_not_a_trailer(self, make_msg: MsgFactory) -> None:
         # A device tree snippet quoted in a reply reads as a trailer
         # whose value happens to look like an address.
@@ -424,6 +438,17 @@ class TestSelfAttestedTrailers:
         assert self._names(
             ('Okonkwo, Amara', 'aokonkwo@example.com'),
             'Reviewed-by: Amara Okonkwo <amara@other.example.org>\n',
+            make_msg,
+        ) == ['Reviewed-by']
+
+    def test_comma_reversed_name_matches_either_way_round(
+        self, make_msg: MsgFactory
+    ) -> None:
+        # Name matching is symmetric, so it does not matter which of the
+        # two spellings is the comma-separated one.
+        assert self._names(
+            ('Amara Okonkwo', 'aokonkwo@example.com'),
+            'Reviewed-by: Okonkwo, Amara <amara@other.example.org>\n',
             make_msg,
         ) == ['Reviewed-by']
 
@@ -1025,9 +1050,7 @@ class TestAuthorAndRepliers:
         assert summary.participants == (ANN,)
         assert summary.repliers == ()
 
-    def test_messages_by_is_exact_and_case_insensitive(
-        self, make_msg: MsgFactory
-    ) -> None:
+    def test_messages_by_matches_addresses(self, make_msg: MsgFactory) -> None:
         patch = make_msg(
             subject='[PATCH 1/1] a', from_addr=ANN, msgid='d1@x', date=DATE1
         )
@@ -1044,24 +1067,22 @@ class TestAuthorAndRepliers:
 
 
 def _reviewed_by_awaiting_reply(
-    summaries: list[ThreadSummary], reviewer: str, me: str
+    summaries: list[ThreadSummary], reviewer: Identity, me: Identity
 ) -> list[str]:
     """The example query, written the way a caller would write it.
 
     "Threads reviewed by *reviewer* that have not yet had a reply from
     *me*" -- meaning I have sent nothing in the thread since the review
     landed.  Every judgement here is the caller's; the module only
-    supplies the facts it leans on.
+    supplies the facts it leans on, and answers both "who is this?"
+    questions the same way.
     """
     hits: list[str] = []
     for summary in summaries:
         reviews = [
             trailer.date
-            for trailer in summary.person_trailers
-            if trailer.key == 'reviewed-by'
-            and trailer.addr
-            and trailer.addr[1].lower() == reviewer.lower()
-            and trailer.date is not None
+            for trailer in summary.trailers_by(reviewer)
+            if trailer.key == 'reviewed-by' and trailer.date is not None
         ]
         if not reviews:
             continue
@@ -1120,7 +1141,7 @@ class TestReviewedAwaitingReplyQuery:
         self, make_msg: MsgFactory
     ) -> None:
         hits = _reviewed_by_awaiting_reply(
-            self._corpus(make_msg), 'sashiko@example.com', 'me@example.com'
+            self._corpus(make_msg), Identity.from_addr(SASHIKO), Identity.from_addr(ME)
         )
         # t2 is answered; t4 is not Sashiko's.  t3 is mine and I have
         # still not replied to the review, which is why being in
@@ -1150,6 +1171,163 @@ class TestReviewedAwaitingReplyQuery:
             ),
         ]
         hits = _reviewed_by_awaiting_reply(
-            summarize_threads(msgs), 'sashiko@example.com', 'me@example.com'
+            summarize_threads(msgs), Identity.from_addr(SASHIKO), Identity.from_addr(ME)
         )
         assert hits == ['e1']
+
+
+class TestEmailMatches:
+    def test_identical_and_case_insensitive(self) -> None:
+        assert email_matches('Bob@Example.COM', 'bob@example.com') is True
+
+    def test_extended_local_part(self) -> None:
+        assert email_matches('foo+kernel@example.com', 'foo@example.com') is True
+
+    def test_one_level_of_subdomain(self) -> None:
+        assert email_matches('foo@linux.intel.com', 'foo@intel.com') is True
+
+    def test_two_levels_is_too_far(self) -> None:
+        assert email_matches('foo@a.b.intel.com', 'foo@intel.com') is False
+
+    def test_different_local_parts_never_match(self) -> None:
+        assert email_matches('foo@intel.com', 'bar@intel.com') is False
+
+    def test_unrelated_domains_do_not_match(self) -> None:
+        assert email_matches('foo@example.com', 'foo@example.org') is False
+
+    def test_a_non_address_does_not_crash(self) -> None:
+        assert email_matches('not-an-address', 'foo@example.com') is False
+
+
+class TestNameMatches:
+    def test_exact_ignoring_case_and_space(self) -> None:
+        assert name_matches('  Ann Submitter ', 'ann submitter') is True
+
+    def test_comma_form_matches_either_direction(self) -> None:
+        straight, comma = 'Amara Okonkwo', 'Okonkwo, Amara'
+        assert name_matches(straight, comma) is True
+        assert name_matches(comma, straight) is True
+
+    def test_empty_matches_nothing(self) -> None:
+        assert name_matches('', '') is False
+        assert name_matches('', 'Ann Submitter') is False
+
+    def test_different_people_do_not_match(self) -> None:
+        assert name_matches('Ann Submitter', 'Bob Other') is False
+
+    def test_comma_form_matches_whole_words_only(self) -> None:
+        # A shorter name that merely spells the start of a longer one is
+        # a different person, however the comma falls.
+        assert name_matches('Alexander Smithson', 'Smith, Alex') is False
+        assert name_matches('Smith, Alex', 'Alexander Smithson') is False
+        assert name_matches('Bob Ngyuen', 'Ng, Bo') is False
+
+    def test_a_middle_name_does_not_stop_the_match(self) -> None:
+        assert name_matches('Amara C. Okonkwo', 'Okonkwo, Amara') is True
+
+    def test_an_aside_in_parentheses_is_ignored(self) -> None:
+        # Kernel senders often carry their employer in the From line.
+        assert name_matches('Bob Reviewer (Arm)', 'Bob Reviewer') is True
+        assert name_matches('Bob Reviewer', 'Bob Reviewer (Arm)') is True
+        assert name_matches('Reviewer, Bob (Arm)', 'Bob Reviewer') is True
+        assert name_matches('Bob Reviewer (Arm)', 'Alice Other') is False
+
+    def test_a_name_that_is_only_an_aside_matches_nothing(self) -> None:
+        assert name_matches('(Arm)', 'Bob Reviewer') is False
+        assert name_matches('(Arm)', '(Arm)') is False
+
+
+class TestIdentity:
+    def test_matches_a_bare_address(self) -> None:
+        person = Identity(addrs=('ann@example.com',))
+        assert person.matches('ANN@example.com') is True
+        assert person.matches('bob@example.com') is False
+
+    def test_a_bare_address_never_matches_on_name(self) -> None:
+        # A string is an address, so a name cannot sneak in through it.
+        person = Identity(names=('Ann Submitter',))
+        assert person.matches('Ann Submitter') is False
+
+    def test_matches_a_pair_on_either_half(self) -> None:
+        person = Identity(addrs=('ann@example.com',), names=('Ann Submitter',))
+        assert person.matches(('Someone Else', 'ann@example.com')) is True
+        assert person.matches(('Ann Submitter', 'ann@elsewhere.org')) is True
+        assert person.matches(('Bob Other', 'bob@example.com')) is False
+
+    def test_spans_several_unrelated_addresses(self) -> None:
+        # The whole point: only a caller's directory knows these two
+        # addresses are one human, and this is where it says so.
+        person = Identity(addrs=('ann@example.com', 'ann@corp.invalid'))
+        assert person.matches('ann@corp.invalid') is True
+
+    def test_matches_another_identity(self) -> None:
+        one = Identity(addrs=('ann@example.com',))
+        two = Identity(addrs=('ann+lists@example.com',))
+        assert one.matches(two) is True
+        assert one.matches(Identity(addrs=('bob@example.com',))) is False
+
+    def test_from_addr_drops_empty_halves(self) -> None:
+        person = Identity.from_addr(('', 'ann@example.com'))
+        assert person.names == ()
+        assert person.addrs == ('ann@example.com',)
+
+    def test_to_dict_is_json_safe(self) -> None:
+        person = Identity(addrs=('ann@example.com',), names=('Ann Submitter',))
+        payload = person.to_dict()
+        assert json.loads(json.dumps(payload)) == payload
+
+
+class TestIdentityOnThreads:
+    def _thread(self, make_msg: MsgFactory) -> ThreadSummary:
+        patch = make_msg(
+            subject='[PATCH 1/1] a', from_addr=ANN, msgid='i1@x', date=DATE1
+        )
+        review = make_msg(
+            subject='Re: [PATCH 1/1] a',
+            from_addr=SASHIKO,
+            msgid='i2@x',
+            in_reply_to='i1@x',
+            date=DATE2,
+            body='Reviewed-by: Sashiko Tanaka <sashiko@example.com>\n',
+        )
+        # Same person as ANN, writing from an address a directory would
+        # have to know about -- but under the same display name.
+        again = make_msg(
+            subject='Re: [PATCH 1/1] a',
+            from_addr=('Ann Submitter', 'ann@corp.invalid'),
+            msgid='i3@x',
+            in_reply_to='i1@x',
+            date=DATE3,
+        )
+        return summarize_thread([patch, review, again])
+
+    def test_messages_by_accepts_an_identity(self, make_msg: MsgFactory) -> None:
+        summary = self._thread(make_msg)
+        assert len(summary.messages_by('ann@example.com')) == 1
+        both = Identity(addrs=('ann@example.com', 'ann@corp.invalid'))
+        assert len(summary.messages_by(both)) == 2
+
+    def test_repliers_drops_the_author_under_another_address(
+        self, make_msg: MsgFactory
+    ) -> None:
+        summary = self._thread(make_msg)
+        # Ann spoke twice from two addresses; both are participants, and
+        # neither counts as somebody having replied to her.
+        assert len(summary.participants) == 3
+        assert summary.repliers == (SASHIKO,)
+
+    def test_trailers_by_attributes_to_the_named_person(
+        self, make_msg: MsgFactory
+    ) -> None:
+        summary = self._thread(make_msg)
+        assert [t.key for t in summary.trailers_by('sashiko@example.com')] == [
+            'reviewed-by'
+        ]
+        assert summary.trailers_by('ann@example.com') == ()
+
+    def test_trailers_by_matches_a_name_when_the_address_differs(
+        self, make_msg: MsgFactory
+    ) -> None:
+        summary = self._thread(make_msg)
+        by_name = Identity(names=('Sashiko Tanaka',))
+        assert [t.key for t in summary.trailers_by(by_name)] == ['reviewed-by']
