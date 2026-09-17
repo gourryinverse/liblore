@@ -400,6 +400,22 @@ class TestSelfAttestedTrailers:
             make_msg,
         ) == ['Reviewed-by']
 
+    def test_an_inbody_from_does_not_name_the_sender(
+        self, make_msg: MsgFactory
+    ) -> None:
+        # Who sent the mail is a header question.  An in-body From: is
+        # body text the sender wrote, so letting it answer would let
+        # anybody tag on anybody's behalf.
+        assert (
+            self._names(
+                ('Mallory', 'mallory@example.net'),
+                'From: Ann Submitter <ann@example.com>\n\nlgtm\n\n'
+                'Reviewed-by: Ann Submitter <ann@example.com>\n',
+                make_msg,
+            )
+            == []
+        )
+
     def test_pasted_snippet_is_not_a_trailer(self, make_msg: MsgFactory) -> None:
         # A device tree snippet quoted in a reply reads as a trailer
         # whose value happens to look like an address.
@@ -483,6 +499,19 @@ class TestInbodyAuthor:
             'real@example.com',
         )
 
+    def test_summary_author_and_sender_may_differ(self, make_msg: MsgFactory) -> None:
+        # A patch relayed by a co-maintainer: git am would record the
+        # in-body author, while the sender is whoever posted it.  Both
+        # answers are right, to two different questions.
+        msg = make_msg(
+            subject='[PATCH 1/1] usb: fix it',
+            from_addr=('Relaying Maintainer', 'maint@example.com'),
+            body='From: Ann Submitter <ann@example.com>\n\nusb: fix it\n\n'
+            'Signed-off-by: Ann Submitter <ann@example.com>\n' + PATCH_TAIL,
+        )
+        assert summarize_message(msg).author == ('Ann Submitter', 'ann@example.com')
+        assert msg_get_author(msg) == ('Relaying Maintainer', 'maint@example.com')
+
     def test_no_inbody_from(self, make_msg: MsgFactory) -> None:
         msg = make_msg(body='usb: fix it\n\nSome commit message.\n')
         assert msg_get_inbody_author(msg) is None
@@ -502,6 +531,36 @@ class TestInbodyAuthor:
     def test_leading_blank_lines_are_allowed(self, make_msg: MsgFactory) -> None:
         msg = make_msg(body='\n\nFrom: Real <real@example.com>\n\nbody\n')
         assert msg_get_inbody_author(msg) == ('Real', 'real@example.com')
+
+
+class TestMungedSender:
+    """Lists that rewrite From for DMARC keep the sender elsewhere."""
+
+    def _munged(self, make_msg: MsgFactory, body: str) -> EmailMessage:
+        msg = make_msg(
+            subject='Re: [PATCH 1/1] usb: fix it',
+            from_addr=('Bob Reviewer via list', 'list@lists.example.org'),
+            body=body,
+        )
+        msg['X-Original-From'] = 'Bob Reviewer <bob@example.com>'
+        return msg
+
+    def test_original_from_names_the_sender(self, make_msg: MsgFactory) -> None:
+        msg = self._munged(make_msg, 'Looks fine.\n')
+        assert msg_get_author(msg) == ('Bob Reviewer', 'bob@example.com')
+        assert msg_get_author(msg, use_inbody=True) == (
+            'Bob Reviewer',
+            'bob@example.com',
+        )
+
+    def test_a_munged_reply_keeps_its_trailer(self, make_msg: MsgFactory) -> None:
+        # Without X-Original-From the sender looks like the list itself,
+        # and a perfectly good tag would be dropped as unattested.
+        msg = self._munged(
+            make_msg,
+            'Looks fine.\n\nReviewed-by: Bob Reviewer <bob@example.com>\n',
+        )
+        assert [t.name for t in extract_trailers(msg)] == ['Reviewed-by']
 
 
 class TestGroupByThread:

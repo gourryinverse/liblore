@@ -363,20 +363,31 @@ def msg_get_inbody_author(msg: EmailMessage) -> tuple[str, str] | None:
 
 
 def msg_get_author(msg: EmailMessage, use_inbody: bool = False) -> tuple[str, str]:
-    """Return ``(name, email)`` for the From header.
+    """Return ``(name, email)`` for whoever sent the message.
+
+    Lists that rewrite From to survive DMARC keep the original sender in
+    ``X-Original-From``, which is preferred over the rewritten header
+    so that the person is reported rather than the mailing list.  The
+    header is unauthenticated -- anybody can set it, and liblore does no
+    DKIM by design -- so this reports who the message claims to be
+    from.  Code that needs proof wants b4's attestation, which checks
+    the header against a signature before believing it.
 
     When *use_inbody* is ``True``, a git-style in-body ``From:`` line
-    takes precedence over the header, matching what ``git am`` would
-    record as the author.  See :func:`msg_get_inbody_author`.
+    takes precedence over both, matching what ``git am`` would record
+    as the author.  See :func:`msg_get_inbody_author`.
     """
     if use_inbody:
         inbody = msg_get_inbody_author(msg)
         if inbody is not None:
             return inbody
     author = ('', 'missing@address.local')
-    fh = msg.get('from')
-    if fh:
-        author = email.utils.getaddresses([fh])[0]
+    for header in ('x-original-from', 'from'):
+        fh = msg.get(header)
+        if fh:
+            addrs = email.utils.getaddresses([clean_header(fh)])
+            if addrs and addrs[0][1]:
+                return addrs[0]
     return author
 
 

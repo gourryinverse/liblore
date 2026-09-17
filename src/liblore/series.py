@@ -696,6 +696,12 @@ def _is_self_attested(trailer: Trailer, author: tuple[str, str]) -> bool:
     may tag on your own behalf, not on somebody else's.  Trailers that
     name nobody -- ``Fixes:``, ``Link:`` and the like -- are not subject
     to this, since there is no identity to compare.
+
+    *author* is expected to come from the message headers.  This is a
+    check on who sent the mail, and nothing a sender writes in the body
+    may answer that.  It is also not a signature check: liblore does no
+    DKIM, so this says a message claims to come from the person it tags,
+    not that it provably does.
     """
     if trailer.addr is None:
         return True
@@ -750,6 +756,10 @@ def _read_trailers(msg: EmailMessage) -> tuple[list[Trailer], bool]:
 
     found, _others = find_trailers(body, followup=True)
     found = [(n, v) for n, v in found if n.lower() not in _REPLY_IGNORES]
+    # Who sent the mail is a question only the headers can answer.  An
+    # in-body From: says who wrote a patch, which is a different
+    # question and is body text the sender chose, so it takes no part in
+    # deciding whether they may sign a tag.
     author = msg_get_author(msg)
     return [
         trailer
