@@ -61,6 +61,7 @@ class _LoreNodeInitKwargs(TypedDict, total=False):
     cache_ttl: int
     follow_upstream: bool
     partial_search: str
+    upstream_holdoff: float
     allowed_upstreams: list[str] | None
 
 
@@ -233,6 +234,17 @@ def _unreachable(ex: RemoteError) -> bool:
     return ex.status_code is None or ex.status_code >= 500
 
 
+class _HeldOffError(RemoteError):
+    """The upstream was not asked: it was unreachable *ago* seconds ago."""
+
+    def __init__(self, netloc: str, ago: float) -> None:
+        super().__init__(
+            f'{netloc} was unreachable {ago:.0f} s ago, not trying it again yet'
+        )
+        self.netloc = netloc
+        self.ago = ago
+
+
 class _Miss(Exception):
     """This partial mirror doesn't have what was asked (see :meth:`LoreNode._answer`).
 
@@ -397,6 +409,7 @@ class LoreNode:
         cache_ttl: int = 600,
         follow_upstream: bool = True,
         partial_search: str = 'local',
+        upstream_holdoff: float = 300.0,
         allowed_upstreams: list[str] | None = None,
     ) -> None:
         self._url = url.rstrip('/')
@@ -448,6 +461,13 @@ class LoreNode:
                 f'{partial_search!r}'
             )
         self._partial_search = partial_search
+        # Also rejects NaN, which would hold the upstream off forever.
+        if not upstream_holdoff >= 0:
+            raise LibloreError(
+                f'Invalid upstream_holdoff (expected 0 or more seconds): '
+                f'{upstream_holdoff!r}'
+            )
+        self._upstream_holdoff = upstream_holdoff
         trusted = set(_BUILTIN_UPSTREAMS)
         for au in allowed_upstreams or []:
             try:
@@ -488,6 +508,9 @@ class LoreNode:
         # The upstream URL whose node could not be built, and why.
         # Guarded by _upstream_lock.
         self._upstream_build_failed: tuple[str, LibloreError] | None = None
+        # The upstream URL and time.monotonic() of its last unreachable
+        # answer, while it is held off.  Guarded by _upstream_lock.
+        self._holdoff_since: tuple[str, float] | None = None
         # set_user_agent() app and version, passed on to upstream nodes.
         self._user_agent_app: tuple[str, str] | None = None
 
@@ -570,6 +593,12 @@ class LoreNode:
             working while the upstream archive is down.  A partial
             mirror can't know what it is missing, so ``upstream`` asks
             the upstream archive first, for users who want every hit.
+
+        ``upstreamholdoff``
+            Seconds (default 300).  After the upstream archive of a
+            partial mirror can't be reached, it is not asked again for
+            this long, so a command doesn't wait for a timeout on every
+            call.  ``0`` asks it every time.
 
         ``allowupstream``
             Multi-valued.  Each value is an origin (``scheme://host``)
@@ -686,6 +715,18 @@ class LoreNode:
                     kwargs['partial_search'] = mode
                 else:
                     logger.debug('Ignoring invalid partialsearch value: %r', val)
+
+        if 'upstream_holdoff' not in kwargs:
+            val = gitcfg.get('upstreamholdoff')
+            if isinstance(val, str):
+                try:
+                    holdoff = float(val)
+                except ValueError:
+                    holdoff = -1.0
+                if holdoff >= 0:
+                    kwargs['upstream_holdoff'] = holdoff
+                else:
+                    logger.debug('Ignoring invalid upstreamholdoff value: %r', val)
 
         if 'allowed_upstreams' not in kwargs:
             allowed = gitcfg.get('allowupstream')
@@ -1238,11 +1279,72 @@ class LoreNode:
         *missing* reads as the start of a sentence, for example
         ``'<msgid> is not'``.
         """
+        if isinstance(ex, _HeldOffError):
+            why = f'{ex.netloc} was unreachable {ex.ago:.0f} s ago'
+        else:
+            why = f'{upstream._netloc} could not be reached: {ex}'
         return NotOnMirrorError(
-            f'{missing} on the local mirror ({self._netloc}), '
-            f'and {upstream._netloc} could not be reached: {ex}',
+            f'{missing} on the local mirror ({self._netloc}), and {why}',
             status_code=ex.status_code,
         )
+
+    def _ask_upstream(self, upstream: LoreNode, remote: Callable[[LoreNode], _T]) -> _T:
+        """Return ``remote(upstream)``, unless *upstream* is held off.
+
+        After *upstream* is unreachable, it is not asked again for
+        ``upstream_holdoff`` seconds: every request would wait for the
+        timeout.  Meanwhile this raises an unreachable
+        :class:`RemoteError` at once.  A real answer, an error included,
+        ends the hold-off; a cancel changes nothing.
+        """
+        ago = self._held_off_for(upstream)
+        if ago is not None:
+            logger.debug('Not asking %s, unreachable %.0f s ago', upstream.url, ago)
+            raise _HeldOffError(upstream._netloc, ago)
+        try:
+            result = remote(upstream)
+        except RemoteError as ex:
+            if _unreachable(ex):
+                self._start_holdoff(upstream, ex)
+            else:
+                self._end_holdoff(upstream)
+            raise
+        self._end_holdoff(upstream)
+        return result
+
+    def _held_off_for(self, upstream: LoreNode) -> float | None:
+        """Seconds since *upstream* was unreachable, while it is held off."""
+        with self._upstream_lock:
+            since = self._holdoff_since
+        if since is None or since[0] != upstream.url:
+            return None
+        ago = time.monotonic() - since[1]
+        if ago >= self._upstream_holdoff:
+            return None
+        return ago
+
+    def _start_holdoff(self, upstream: LoreNode, ex: RemoteError) -> None:
+        if self._upstream_holdoff <= 0:
+            return
+        with self._upstream_lock:
+            # Another thread's request may have started it already.
+            if self._held_off_for(upstream) is not None:
+                return
+            self._holdoff_since = (upstream.url, time.monotonic())
+        logger.warning(
+            '%s unreachable (%s), not trying it again for %.0f s',
+            upstream._netloc,
+            ex,
+            self._upstream_holdoff,
+        )
+
+    def _end_holdoff(self, upstream: LoreNode) -> None:
+        with self._upstream_lock:
+            since = self._holdoff_since
+            if since is None or since[0] != upstream.url:
+                return
+            self._holdoff_since = None
+        logger.debug('%s answered, hold-off ended', upstream.url)
 
     def _answer(
         self,
@@ -1280,7 +1382,7 @@ class LoreNode:
             if upstream is not None:
                 logger.debug('Asking %s first for %s', upstream.url, what)
                 try:
-                    return remote(upstream)
+                    return self._ask_upstream(upstream, remote)
                 except RemoteError as ex:
                     if not _unreachable(ex):
                         raise
@@ -1295,7 +1397,15 @@ class LoreNode:
                 if on_outage is not None and _unreachable(ex):
                     return on_outage(ex)
                 raise
-            return remote(upstream)
+            try:
+                return self._ask_upstream(upstream, remote)
+            except _HeldOffError as held:
+                # Say which failure the caller is looking at: the
+                # hold-off alone reads as if the mirror had answered.
+                raise RemoteError(
+                    f'{what}: the local mirror ({self._netloc}) is unreachable '
+                    f'({ex}), and {held}'
+                ) from held
 
     def _after_miss(
         self, miss: _Miss, what: str, remote: Callable[[LoreNode], _T]
@@ -1310,7 +1420,7 @@ class LoreNode:
         upstream = miss.upstream
         logger.debug('%s not on %s, asking %s', what, self._url, upstream.url)
         try:
-            return remote(upstream)
+            return self._ask_upstream(upstream, remote)
         except RemoteError as ex:
             if not _unreachable(ex):
                 raise

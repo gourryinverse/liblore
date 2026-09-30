@@ -8,7 +8,8 @@ import json
 import logging
 import os
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -445,6 +446,24 @@ class TestGitConfig:
         node = self.from_config({'partialsearch': 'sideways'})
         assert node._partial_search == 'local'
 
+    @pytest.mark.parametrize(('value', 'holdoff'), [('60', 60.0), (' 0 ', 0.0)])
+    def test_upstreamholdoff(self, value: str, holdoff: float) -> None:
+        node = self.from_config({'upstreamholdoff': value})
+        assert node._upstream_holdoff == holdoff
+
+    def test_upstreamholdoff_default(self) -> None:
+        assert self.from_config({})._upstream_holdoff == 300.0
+
+    @pytest.mark.parametrize('value', ['soon', '-5', 'nan'])
+    def test_invalid_upstreamholdoff_keeps_default(self, value: str) -> None:
+        node = self.from_config({'upstreamholdoff': value})
+        assert node._upstream_holdoff == 300.0
+
+    @pytest.mark.parametrize('value', [-1.0, float('nan')])
+    def test_invalid_upstream_holdoff_argument(self, value: float) -> None:
+        with pytest.raises(LibloreError, match='upstream_holdoff'):
+            LoreNode(LOCAL, upstream_holdoff=value)
+
     def test_invalid_partial_search_argument(self) -> None:
         with pytest.raises(LibloreError, match='partial_search'):
             LoreNode(LOCAL, partial_search='sideways')
@@ -787,6 +806,7 @@ class PartialNode:
         learned: bool = True,
         follow_upstream: bool = True,
         partial_search: str = 'local',
+        upstream_holdoff: float = 300.0,
     ) -> LoreNode:
         """Return a node, by default one that knows it is partial."""
         node = LoreNode(
@@ -794,6 +814,7 @@ class PartialNode:
             cache_dir=str(tmp_path),
             follow_upstream=follow_upstream,
             partial_search=partial_search,
+            upstream_holdoff=upstream_holdoff,
         )
         if learned:
             fetch(node, headers=PARTIAL)
@@ -1515,3 +1536,327 @@ class TestUnreachable(PartialNode):
             with pytest.raises(RemoteError) as exc:
                 node.get_thread_updates_since(MSGID, SINCE)
         assert not isinstance(exc.value, NotOnMirrorError)
+
+
+# =====================================================================
+# L13: upstream hold-off
+# =====================================================================
+
+MIRROR_MBOX = f'https://mirror.example.com/all/{Q}/t.mbox.gz'
+
+
+class Clock:
+    """time.monotonic(), moved forward by the test."""
+
+    def __init__(self) -> None:
+        self.offset = 0.0
+        self._real = time.monotonic
+
+    def __call__(self) -> float:
+        return self._real() + self.offset
+
+    def advance(self, seconds: float) -> None:
+        self.offset += seconds
+
+
+def holdoff_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return warnings_about(caplog, 'not trying it again')
+
+
+class TestHoldOff(PartialNode):
+    @pytest.fixture
+    def clock(self) -> Iterator[Clock]:
+        clock = Clock()
+        with patch('liblore.node.time.monotonic', clock):
+            yield clock
+
+    def miss(self, rsps: responses.RequestsMock, status: int | None = None) -> None:
+        """Register a local mbox miss, and an unreachable upstream."""
+        rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+        add_down(rsps, responses.GET, UP_MBOX, status)
+
+    @DOWN
+    def test_two_misses_one_upstream_request(
+        self,
+        tmp_path: Path,
+        clock: Clock,
+        caplog: pytest.LogCaptureFixture,
+        status: int | None,
+    ) -> None:
+        node = self.node(tmp_path)
+        with (
+            caplog.at_level(logging.WARNING, logger='liblore.node'),
+            responses.RequestsMock() as rsps,
+        ):
+            self.miss(rsps, status)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+            clock.advance(42)
+            with pytest.raises(NotOnMirrorError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', UP_MBOX)) == 1
+        assert 'lore.kernel.org was unreachable 42 s ago' in str(exc.value)
+        assert 'could not be reached' not in str(exc.value)
+        # Nothing answered the second time.
+        assert exc.value.status_code is None
+        warned = holdoff_warnings(caplog)
+        assert len(warned) == 1
+        assert 'lore.kernel.org' in warned[0]
+        assert '300 s' in warned[0]
+
+    def test_mirror_still_asked_while_held_off(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            self.miss(rsps)
+            for _ in range(2):
+                with pytest.raises(NotOnMirrorError):
+                    node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps) == [
+                ('GET', LOCAL_MBOX),
+                ('GET', UP_MBOX),
+                ('GET', LOCAL_MBOX),
+            ]
+
+    def test_covers_every_method(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            self.miss(rsps)
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.POST, LOCAL_QUERY, status=404, headers=PARTIAL)
+            rsps.add(responses.HEAD, LOCAL_RAW, status=404, headers=PARTIAL)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+            with pytest.raises(NotOnMirrorError, match='ago'):
+                node.get_message_by_msgid(MSGID)
+            with pytest.raises(NotOnMirrorError, match='ago'):
+                node.get_mbox_by_query('test')
+            with pytest.raises(NotOnMirrorError, match='ago'):
+                node.get_thread_updates_since(MSGID, SINCE)
+            upstream = [u for _, u in urls(rsps) if u and u.startswith(UPSTREAM)]
+            assert upstream == [UP_MBOX]
+
+    def test_upstream_first_search_held_off_is_degraded(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path, partial_search='upstream')
+        with responses.RequestsMock() as rsps:
+            self.miss(rsps)
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert ('POST', UP_QUERY) not in urls(rsps)
+
+    @pytest.mark.parametrize(
+        ('what', 'method', 'local_url'),
+        [
+            ('mbox', responses.GET, LOCAL_MBOX),
+            ('raw', responses.GET, LOCAL_RAW),
+            ('search', responses.POST, LOCAL_QUERY),
+            ('since', responses.HEAD, LOCAL_RAW),
+        ],
+    )
+    def test_local_down_while_held_off(
+        self, tmp_path: Path, what: str, method: str, local_url: str
+    ) -> None:
+        # Both down: the upstream's error, which now needs no request.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            self.miss(rsps)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+            rsps.remove(responses.GET, LOCAL_MBOX)
+            add_down(rsps, method, local_url, None)
+            calls: dict[str, Callable[[], object]] = {
+                'mbox': lambda: node.get_mbox_by_msgid(MSGID),
+                'raw': lambda: node.get_message_by_msgid(MSGID),
+                'search': lambda: node.get_mbox_by_query('test'),
+                'since': lambda: node.get_thread_updates_since(MSGID, SINCE),
+            }
+            with pytest.raises(RemoteError, match='ago') as exc:
+                calls[what]()
+            upstream = [u for _, u in urls(rsps) if u and u.startswith(UPSTREAM)]
+            assert upstream == [UP_MBOX]
+        assert not isinstance(exc.value, NotOnMirrorError)
+        assert exc.value.status_code is None
+        # The error names both failures.
+        assert LOCAL_HOST in str(exc.value)
+        assert 'unreachable' in str(exc.value)
+
+    def test_asked_again_when_time_is_up(
+        self, tmp_path: Path, clock: Clock, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = self.node(tmp_path)
+        with (
+            caplog.at_level(logging.WARNING, logger='liblore.node'),
+            responses.RequestsMock() as rsps,
+        ):
+            self.miss(rsps)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+            clock.advance(300)
+            with pytest.raises(NotOnMirrorError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', UP_MBOX)) == 2
+        assert 'could not be reached' in str(exc.value)
+        # Still unreachable: a new hold-off, with its own warning.
+        assert len(holdoff_warnings(caplog)) == 2
+
+    def test_success_after_time_is_up(
+        self, tmp_path: Path, clock: Clock, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            add_down(rsps, responses.GET, UP_MBOX, None)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+            clock.advance(300)
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+
+    def in_flight(
+        self, node: LoreNode, answer: Callable[[], tuple[int, dict[str, str], bytes]]
+    ) -> Callable[[object], tuple[int, dict[str, str], bytes]]:
+        """A callback for a request that another thread's miss overtakes.
+
+        The other thread's upstream request fails, and starts a hold-off,
+        before this one gets *answer*.
+        """
+
+        def callback(_req: object) -> tuple[int, dict[str, str], bytes]:
+            other = threading.Thread(target=self.raw_miss, args=(node,))
+            other.start()
+            other.join()
+            return answer()
+
+        return callback
+
+    @staticmethod
+    def raw_miss(node: LoreNode) -> None:
+        with pytest.raises(NotOnMirrorError):
+            node.get_message_by_msgid(MSGID)
+
+    @pytest.mark.parametrize('status', [200, 404])
+    def test_answer_in_flight_ends_holdoff(
+        self, tmp_path: Path, sample_mbox: bytes, status: int
+    ) -> None:
+        # The upstream answers a request sent before another thread
+        # started a hold-off: it is back, so stop holding off.  A "not
+        # found" is an answer too.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            body = gz(sample_mbox) if status == 200 else b''
+            rsps.add_callback(
+                responses.GET,
+                UP_MBOX,
+                callback=self.in_flight(node, lambda: (status, {}, body)),
+            )
+            if status == 404:
+                # The upstream's own redirect lookup.
+                rsps.add(responses.HEAD, f'https://lore.kernel.org/{Q}/', status=404)
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            add_down(rsps, responses.GET, UP_RAW, None)
+            if status == 200:
+                assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            else:
+                with pytest.raises(RemoteError):
+                    node.get_mbox_by_msgid(MSGID)
+            self.raw_miss(node)
+            assert urls(rsps).count(('GET', UP_RAW)) == 2
+
+    def test_failure_in_flight_warns_once(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Two requests fail at the same time: one hold-off, one warning.
+        node = self.node(tmp_path)
+
+        def fail() -> tuple[int, dict[str, str], bytes]:
+            raise requests.ConnectionError('Connection refused')
+
+        with (
+            caplog.at_level(logging.WARNING, logger='liblore.node'),
+            responses.RequestsMock() as rsps,
+        ):
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add_callback(
+                responses.GET, UP_MBOX, callback=self.in_flight(node, fail)
+            )
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            add_down(rsps, responses.GET, UP_RAW, None)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+        assert len(holdoff_warnings(caplog)) == 1
+
+    def test_real_answer_starts_no_holdoff(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, status=404)
+            rsps.add(responses.HEAD, f'https://lore.kernel.org/{Q}/', status=404)
+            for _ in range(2):
+                with pytest.raises(RemoteError) as exc:
+                    node.get_mbox_by_msgid(MSGID)
+                assert exc.value.status_code == 404
+            assert urls(rsps).count(('GET', UP_MBOX)) == 2
+
+    def test_cancel_starts_no_holdoff(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+
+        def cancel_then_fail(_req: object) -> tuple[int, dict[str, str], bytes]:
+            node.cancel_active()
+            raise requests.ConnectionError('Connection aborted')
+
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add_callback(responses.GET, UP_MBOX, callback=cancel_then_fail)
+            add_down(rsps, responses.GET, UP_MBOX, None)
+            with pytest.raises(OperationCancelledError):
+                node.get_mbox_by_msgid(MSGID)
+            with pytest.raises(NotOnMirrorError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', UP_MBOX)) == 2
+        assert 'could not be reached' in str(exc.value)
+
+    def test_zero_turns_it_off(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = self.node(tmp_path, upstream_holdoff=0)
+        with (
+            caplog.at_level(logging.WARNING, logger='liblore.node'),
+            responses.RequestsMock() as rsps,
+        ):
+            self.miss(rsps)
+            for _ in range(2):
+                with pytest.raises(NotOnMirrorError):
+                    node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', UP_MBOX)) == 2
+        assert holdoff_warnings(caplog) == []
+
+    def test_new_upstream_is_not_held_off(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # The hold-off is for the upstream that failed, not its successor.
+        node = LoreNode(
+            LOCAL,
+            cache_dir=str(tmp_path),
+            allowed_upstreams=['https://mirror.example.com'],
+        )
+        fetch(node, headers=PARTIAL)
+        with responses.RequestsMock() as rsps:
+            self.miss(rsps)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID)
+            rsps.replace(responses.GET, LOCAL_MBOX, status=404, headers=OTHER)
+            rsps.add(responses.GET, MIRROR_MBOX, body=gz(sample_mbox))
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+
+    def test_new_node_starts_without_holdoff(self, tmp_path: Path) -> None:
+        with responses.RequestsMock() as rsps:
+            self.miss(rsps)
+            for _ in range(2):
+                node = self.node(tmp_path)
+                with pytest.raises(NotOnMirrorError):
+                    node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', UP_MBOX)) == 2
