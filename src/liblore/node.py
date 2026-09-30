@@ -410,9 +410,26 @@ class LoreNode:
             self._norm_url = _normalize_url(self._url)
         except ValueError:
             self._norm_url = self._url
-        self._upstream_lock = threading.Lock()
+        # Re-entrant: _get_upstream_node() holds it while it calls
+        # _get_upstream_url(), and cancel_active() may run from a signal
+        # handler on a thread that holds it.
+        self._upstream_lock = threading.RLock()
         self._upstream_url: str | None = None
         self._upstream_loaded = False
+        # The node for _upstream_url, built on first use.  Nodes for an
+        # earlier upstream URL are kept until close(): another thread
+        # may still be using them.
+        self._upstream_node: LoreNode | None = None
+        self._old_upstream_nodes: list[LoreNode] = []
+        # Held while an upstream node is built, so that two threads
+        # don't build two.  Not _upstream_lock: the build runs git, and
+        # cancel_active() must not wait for that.
+        self._upstream_build_lock = threading.Lock()
+        # The upstream URL whose node could not be built, and why.
+        # Guarded by _upstream_lock.
+        self._upstream_build_failed: tuple[str, LibloreError] | None = None
+        # set_user_agent() app and version, passed on to upstream nodes.
+        self._user_agent_app: tuple[str, str] | None = None
 
         if cache_dir is not None:
             os.makedirs(cache_dir, exist_ok=True)
@@ -633,6 +650,13 @@ class LoreNode:
         logger.debug('Set user-agent to: %s', self._user_agent)
         if self._session is not None and self._owns_session:
             self._session.headers.update({'User-Agent': self._user_agent})
+        # The upstream gets no plus: it identifies this installation to
+        # this server's operator, and must not go to another host just
+        # because a mirror named it.
+        with self._upstream_lock:
+            self._user_agent_app = (app_name, version)
+        for node in self._upstream_nodes():
+            node.set_user_agent(app_name, version)
 
     def set_requests_session(self, session: requests.Session) -> None:
         """Inject a pre-existing :class:`requests.Session`.
@@ -643,6 +667,8 @@ class LoreNode:
         self._session = session
         self._owns_session = False
         logger.debug('Using caller-provided requests session')
+        for node in self._upstream_nodes():
+            node.set_requests_session(session)
 
     def _get_session(self) -> requests.Session:
         """Return the session, creating one if needed."""
@@ -653,11 +679,20 @@ class LoreNode:
         return self._session
 
     def close(self) -> None:
-        """Close the session if we created it (not externally injected)."""
+        """Close the session if we created it (not externally injected).
+
+        Also closes the upstream nodes of a partial mirror.
+        """
         if self._session is not None and self._owns_session:
             self._session.close()
         self._session = None
         self._owns_session = False
+        with self._upstream_lock:
+            nodes = self._upstream_nodes()
+            self._upstream_node = None
+            self._old_upstream_nodes = []
+        for node in nodes:
+            node.close()
 
     def _abort_owned_session(self) -> None:
         """Close and drop the owned session so blocked socket reads raise.
@@ -723,6 +758,8 @@ class LoreNode:
         with self._cancel_lock:
             self._cancel_generation += 1
         self._abort_owned_session()
+        for node in self._upstream_nodes():
+            node.cancel_active()
 
     def shutdown(self) -> None:
         """Cancel active operations and refuse all new ones.
@@ -736,6 +773,8 @@ class LoreNode:
         """
         self._shutdown_event.set()
         self._abort_owned_session()
+        for node in self._upstream_nodes():
+            node.shutdown()
 
     @property
     def is_shutdown(self) -> bool:
@@ -993,6 +1032,74 @@ class LoreNode:
         with self._upstream_lock:
             self._load_upstream()
             return self._upstream_url
+
+    def _upstream_nodes(self) -> list[LoreNode]:
+        """Return every upstream node built so far, current one last."""
+        with self._upstream_lock:
+            nodes = list(self._old_upstream_nodes)
+            if self._upstream_node is not None:
+                nodes.append(self._upstream_node)
+            return nodes
+
+    def _get_upstream_node(self) -> LoreNode | None:
+        """Return the node for the learned upstream, building it on first use.
+
+        Returns ``None`` for a full node, and once this node is shut
+        down: there is no upstream fallback after :meth:`shutdown`.
+
+        The upstream node reads the user's git config for its own
+        origin, so its fallbacks, probing, timeouts and
+        ``useragentplus`` apply.  It never follows an upstream itself
+        (one hop only), and adds no authentication headers: this node
+        does that, once, for the messages it returns.
+
+        Raises :class:`~liblore.LibloreError` when that git config
+        can't be used.  The error is remembered, so the config is not
+        read again for the same upstream.
+        """
+        if self._shutdown_event.is_set():
+            return None
+        with self._upstream_lock:
+            url = self._get_upstream_url()
+            if url is None:
+                return None
+            node = self._upstream_node
+            if node is not None and node.url == url:
+                return node
+        with self._upstream_build_lock:
+            with self._upstream_lock:
+                # Another thread may have built it while this one waited.
+                node = self._upstream_node
+                if node is not None and node.url == url:
+                    return node
+                failed = self._upstream_build_failed
+            if failed is not None and failed[0] == url:
+                raise failed[1].with_traceback(None)
+            try:
+                node = LoreNode.from_git_config(
+                    url,
+                    follow_upstream=False,
+                    cache_dir=self._cache_dir,
+                    cache_ttl=self._cache_ttl,
+                    add_auth_headers=False,
+                )
+            except LibloreError as ex:
+                with self._upstream_lock:
+                    self._upstream_build_failed = (url, ex)
+                raise
+            if self._session is not None and not self._owns_session:
+                node.set_requests_session(self._session)
+            with self._upstream_lock:
+                if self._user_agent_app is not None:
+                    node.set_user_agent(*self._user_agent_app)
+                if self._shutdown_event.is_set():
+                    # shutdown() ran while the node was being built.
+                    node.shutdown()
+                if self._upstream_node is not None:
+                    self._old_upstream_nodes.append(self._upstream_node)
+                self._upstream_node = node
+            logger.debug('Built upstream node for %s', url)
+            return node
 
     def _probe_one(self, origin: str) -> tuple[str, float]:
         """HEAD manifest.js.gz on *origin*, return (origin, elapsed).
