@@ -1006,23 +1006,24 @@ class LoreNode:
         ``/{list}/{msgid}/`` when the message-id is found.  This method
         follows that redirect and fetches the mbox from the discovered
         location.  Returns the response from the final GET (or the
-        failed HEAD response if no redirect was found).
+        failed HEAD response if the message-id wasn't found).
+
+        Both requests go through :meth:`_request`, so they fail over,
+        honour a cancel, and raise :class:`RemoteError` when no host
+        answers.
         """
         head_url = f'{self._canonical_origin}/{qmsgid}/'
-        session = self._get_session()
         logger.debug('Trying HEAD %s for redirect discovery', head_url)
-        head_resp = session.head(
-            head_url,
-            allow_redirects=True,
-            timeout=self._request_timeout,
-        )
-        if head_resp.status_code == 200 and head_resp.url != head_url:
-            # Redirected — use the resolved location
-            resolved = head_resp.url.rstrip('/')
-            mbox_url = f'{resolved}/t.mbox.gz'
-            logger.debug('Resolved via redirect: %s', mbox_url)
-            return self._request('GET', mbox_url)
-        return head_resp
+        head_resp = self._request('HEAD', head_url, allow_redirects=True)
+        if head_resp.status_code != 200:
+            return head_resp
+        # The answer may come from a fallback origin, and _request()
+        # expects URLs on the canonical one, so keep only the path.
+        # Without a redirect this is head_url's own path.
+        resolved = urllib.parse.urlsplit(head_resp.url).path.rstrip('/')
+        mbox_url = f'{self._canonical_origin}{resolved}/t.mbox.gz'
+        logger.debug('Resolved via redirect: %s', mbox_url)
+        return self._request('GET', mbox_url)
 
     @_operation_scope
     def get_mbox_by_query(

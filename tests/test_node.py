@@ -242,6 +242,54 @@ class TestGetMboxByMsgid:
                 node.get_mbox_by_msgid('nonexistent@example.com')
             assert ei.value.status_code == 404
 
+    def test_404_head_connection_error_is_remote_error(self) -> None:
+        """A HEAD that can't connect raises RemoteError, not requests' error."""
+        with responses.RequestsMock() as rsps:
+            node = LoreNode('https://lore.kernel.org/all')
+            rsps.add(
+                responses.GET,
+                'https://lore.kernel.org/all/test%40example.com/t.mbox.gz',
+                status=404,
+            )
+            rsps.add(
+                responses.HEAD,
+                'https://lore.kernel.org/test%40example.com/',
+                body=requests.ConnectionError('refused'),
+            )
+
+            with pytest.raises(RemoteError, match='All hosts failed') as ei:
+                node.get_mbox_by_msgid('test@example.com')
+            assert ei.value.status_code is None
+
+    def test_404_head_without_redirect_fetches_bare_mbox(
+        self, sample_mbox: bytes
+    ) -> None:
+        """A HEAD 200 with no redirect fetches the mbox from the bare path.
+
+        The HEAD response has no body, so it must not be taken for the
+        mbox itself.
+        """
+        with responses.RequestsMock() as rsps:
+            node = LoreNode('https://lore.kernel.org/all')
+            rsps.add(
+                responses.GET,
+                'https://lore.kernel.org/all/test%40example.com/t.mbox.gz',
+                status=404,
+            )
+            rsps.add(
+                responses.HEAD,
+                'https://lore.kernel.org/test%40example.com/',
+                status=200,
+            )
+            rsps.add(
+                responses.GET,
+                'https://lore.kernel.org/test%40example.com/t.mbox.gz',
+                body=gzip.compress(sample_mbox),
+                status=200,
+            )
+
+            assert node.get_mbox_by_msgid('test@example.com') == sample_mbox
+
 
 class TestGetMboxByQuery:
     def test_returns_raw_bytes(self, sample_mbox: bytes) -> None:
@@ -843,14 +891,91 @@ class TestFallback:
             )
             rsps.add(
                 responses.HEAD,
-                'https://lore.kernel.org/test%40example.com/',
+                'http://mirror.local/test%40example.com/',
                 status=404,
             )
 
             with pytest.raises(RemoteError, match='Server returned an error'):
                 node.get_mbox_by_msgid('test@example.com')
-            # Fallback returns 404, then redirect discovery also returns 404.
+            # Fallback returns 404, then redirect discovery also returns
+            # 404 from the same fallback.
             assert len(rsps.calls) == 2
+
+    def test_head_redirect_fails_over(self, sample_mbox: bytes) -> None:
+        """The redirect lookup fails over like any other request."""
+        with responses.RequestsMock() as rsps:
+            node = LoreNode(
+                'https://lore.kernel.org/all',
+                fallback_urls=['http://mirror.local'],
+            )
+            rsps.add(
+                responses.GET,
+                'http://mirror.local/all/test%40example.com/t.mbox.gz',
+                status=404,
+            )
+            rsps.add(
+                responses.HEAD,
+                'http://mirror.local/test%40example.com/',
+                body=requests.ConnectionError('refused'),
+            )
+            rsps.add(
+                responses.HEAD,
+                'https://lore.kernel.org/test%40example.com/',
+                status=302,
+                headers={
+                    'Location': 'https://lore.kernel.org/tools/test%40example.com/'
+                },
+            )
+            rsps.add(
+                responses.HEAD,
+                'https://lore.kernel.org/tools/test%40example.com/',
+                status=200,
+            )
+            rsps.add(
+                responses.GET,
+                'http://mirror.local/tools/test%40example.com/t.mbox.gz',
+                body=gzip.compress(sample_mbox),
+                status=200,
+            )
+
+            assert node.get_mbox_by_msgid('test@example.com') == sample_mbox
+
+    def test_head_redirect_on_fallback_origin(self, sample_mbox: bytes) -> None:
+        """A redirect found on a fallback origin maps back onto every origin.
+
+        The resolved URL names the fallback host, so it can't be handed
+        to the origin rotation as it is.
+        """
+        with responses.RequestsMock() as rsps:
+            node = LoreNode(
+                'https://lore.kernel.org/all',
+                fallback_urls=['http://mirror.local'],
+            )
+            rsps.add(
+                responses.GET,
+                'http://mirror.local/all/test%40example.com/t.mbox.gz',
+                status=404,
+            )
+            rsps.add(
+                responses.HEAD,
+                'http://mirror.local/test%40example.com/',
+                status=302,
+                headers={'Location': 'http://mirror.local/tools/test%40example.com/'},
+            )
+            rsps.add(
+                responses.HEAD,
+                'http://mirror.local/tools/test%40example.com/',
+                status=200,
+            )
+            rsps.add(
+                responses.GET,
+                'http://mirror.local/tools/test%40example.com/t.mbox.gz',
+                body=gzip.compress(sample_mbox),
+                status=200,
+            )
+
+            assert node.get_mbox_by_msgid('test@example.com') == sample_mbox
+            assert len(rsps.calls) == 4
 
     def test_all_hosts_fail_connection(self) -> None:
         with responses.RequestsMock() as rsps:
@@ -2327,6 +2452,22 @@ class TestCancellation:
 
         with pytest.raises(OperationCancelledError):
             node.get_message_by_msgid('first@example.com')
+
+    def test_head_redirect_cancel_mid_flight(self) -> None:
+        """A cancel during the redirect lookup raises OperationCancelledError."""
+        node = LoreNode('https://lore.kernel.org/all')
+        mock_session = MagicMock()
+        mock_session.get.return_value = MagicMock(status_code=404)
+
+        def boom(*_args: object, **_kwargs: object) -> object:
+            node.cancel_active()
+            raise requests.ConnectionError('socket closed')
+
+        mock_session.head.side_effect = boom
+        node.set_requests_session(mock_session)
+
+        with pytest.raises(OperationCancelledError):
+            node.get_mbox_by_msgid('first@example.com')
 
     def test_validate_cancel_mid_flight_is_not_remote_error(self) -> None:
         """A cancel during validate() raises OperationCancelledError."""

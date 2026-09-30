@@ -37,6 +37,13 @@ v0.10.0 (unreleased)
   of OperationCancelledError when cancel_active() or shutdown() stops
   them mid-request. Code that catches RemoteError no longer mistakes a
   cancel for a server failure.
+- Fix the redirect lookup in get_mbox_by_msgid() (the HEAD it sends
+  after a 404) bypassing the fallback origins. It now fails over like
+  other requests, raises OperationCancelledError on a cancel and
+  RemoteError when no host answers, instead of a bare requests
+  exception. A redirect found on a fallback origin no longer produces a
+  broken mbox URL. A 200 without a redirect now fetches the mbox
+  instead of returning an empty thread.
 
 v0.9.0 (2026-08-12)
 -------------------
