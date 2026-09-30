@@ -205,7 +205,7 @@ def _git_bool(value: str) -> bool | None:
 # the partial mirrors spec).
 _BUILTIN_UPSTREAMS = frozenset({'https://lore.kernel.org'})
 # Where a partial node sends whole-archive searches first.
-_PARTIAL_SEARCH_MODES = ('upstream', 'local')
+_PARTIAL_SEARCH_MODES = ('local', 'upstream')
 
 # Hosts already warned about, so each untrusted upstream is logged once
 # per process, not once per response.
@@ -396,7 +396,7 @@ class LoreNode:
         cache_dir: str | None = None,
         cache_ttl: int = 600,
         follow_upstream: bool = True,
-        partial_search: str = 'upstream',
+        partial_search: str = 'local',
         allowed_upstreams: list[str] | None = None,
     ) -> None:
         self._url = url.rstrip('/')
@@ -444,7 +444,7 @@ class LoreNode:
         self._follow_upstream = follow_upstream
         if partial_search not in _PARTIAL_SEARCH_MODES:
             raise LibloreError(
-                f'Invalid partial_search (expected upstream or local): '
+                f'Invalid partial_search (expected local or upstream): '
                 f'{partial_search!r}'
             )
         self._partial_search = partial_search
@@ -563,11 +563,13 @@ class LoreNode:
             from the upstream archive.
 
         ``partialsearch``
-            ``upstream`` (the default) or ``local``.  Where a partial
-            mirror sends a whole-archive search first.  A partial
-            mirror can't know what it is missing, so by default the
-            upstream archive answers.  ``local`` asks the mirror first,
-            and the upstream archive only when the mirror finds nothing.
+            ``local`` (the default) or ``upstream``.  Where a partial
+            mirror sends a whole-archive search first.  By default the
+            mirror answers, and the upstream archive is asked only when
+            the mirror finds nothing, so searches stay fast and keep
+            working while the upstream archive is down.  A partial
+            mirror can't know what it is missing, so ``upstream`` asks
+            the upstream archive first, for users who want every hit.
 
         ``allowupstream``
             Multi-valued.  Each value is an origin (``scheme://host``)
@@ -1727,10 +1729,11 @@ class LoreNode:
         include the full thread for every matching message (public-inbox
         ``t=1`` parameter).
 
-        On a partial mirror the search goes to the upstream archive,
-        because the mirror can't know which hits it is missing.  With
-        ``partial_search='local'`` the mirror is asked first, and the
-        upstream archive only when the mirror finds nothing.
+        On a partial mirror the mirror answers, and the upstream archive
+        is asked only when the mirror finds nothing.  A hit the mirror
+        doesn't have is then missed.  With ``partial_search='upstream'``
+        the upstream archive is asked first, and the mirror only when
+        the upstream archive can't be reached.
         """
 
         # A named function, not a lambda: mypy can't infer a lambda

@@ -433,17 +433,17 @@ class TestGitConfig:
 
     @pytest.mark.parametrize(
         ('value', 'mode'),
-        [('local', 'local'), (' LOCAL ', 'local'), ('upstream', 'upstream')],
+        [('local', 'local'), ('upstream', 'upstream'), (' UPSTREAM ', 'upstream')],
     )
     def test_partialsearch(self, value: str, mode: str) -> None:
         assert self.from_config({'partialsearch': value})._partial_search == mode
 
     def test_partialsearch_default(self) -> None:
-        assert self.from_config({})._partial_search == 'upstream'
+        assert self.from_config({})._partial_search == 'local'
 
     def test_invalid_partialsearch_keeps_default(self) -> None:
         node = self.from_config({'partialsearch': 'sideways'})
-        assert node._partial_search == 'upstream'
+        assert node._partial_search == 'local'
 
     def test_invalid_partial_search_argument(self) -> None:
         with pytest.raises(LibloreError, match='partial_search'):
@@ -786,7 +786,7 @@ class PartialNode:
         *,
         learned: bool = True,
         follow_upstream: bool = True,
-        partial_search: str = 'upstream',
+        partial_search: str = 'local',
     ) -> LoreNode:
         """Return a node, by default one that knows it is partial."""
         node = LoreNode(
@@ -1002,7 +1002,7 @@ class TestMissRules(PartialNode):
     def test_search_goes_upstream_first(
         self, tmp_path: Path, sample_mbox: bytes
     ) -> None:
-        node = self.node(tmp_path)
+        node = self.node(tmp_path, partial_search='upstream')
         with responses.RequestsMock() as rsps:
             rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
             assert node.get_mbox_by_query('test') == sample_mbox
@@ -1010,7 +1010,7 @@ class TestMissRules(PartialNode):
 
     def test_search_upstream_404_is_final(self, tmp_path: Path) -> None:
         # lore.kernel.org answers "no results" with a 404, not an empty 200.
-        node = self.node(tmp_path)
+        node = self.node(tmp_path, partial_search='upstream')
         with responses.RequestsMock() as rsps:
             rsps.add(responses.POST, UP_QUERY, status=404)
             with pytest.raises(RemoteError) as exc:
@@ -1022,7 +1022,7 @@ class TestMissRules(PartialNode):
     def test_search_learned_from_same_answer(
         self, tmp_path: Path, sample_mbox: bytes
     ) -> None:
-        node = self.node(tmp_path, learned=False)
+        node = self.node(tmp_path, learned=False, partial_search='upstream')
         with responses.RequestsMock() as rsps:
             rsps.add(responses.POST, LOCAL_QUERY, body=gz(b'partial'), headers=PARTIAL)
             rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
@@ -1031,6 +1031,18 @@ class TestMissRules(PartialNode):
         # The mirror's partial answer was not cached.
         key = node._cache_key('mbox_by_query', 'test', 'False')
         assert node._cache_read(key) is None
+
+    def test_search_default_is_local_first(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # The mirror answers without the upstream archive, which is the
+        # point of having a mirror: fast, and working while lore is down.
+        node = LoreNode(LOCAL, cache_dir=str(tmp_path))
+        fetch(node, headers=PARTIAL)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
 
     def test_search_local_mode_hit(self, tmp_path: Path, sample_mbox: bytes) -> None:
         node = self.node(tmp_path, partial_search='local')
@@ -1327,7 +1339,7 @@ class TestUnreachable(PartialNode):
         caplog: pytest.LogCaptureFixture,
         status: int | None,
     ) -> None:
-        node = self.node(tmp_path)
+        node = self.node(tmp_path, partial_search='upstream')
         with (
             caplog.at_level(logging.WARNING, logger='liblore.node'),
             responses.RequestsMock() as rsps,
@@ -1346,7 +1358,7 @@ class TestUnreachable(PartialNode):
     ) -> None:
         # The mirror's own answer says it is partial, and then the
         # upstream can't be reached: the answer is degraded, not cached.
-        node = self.node(tmp_path, learned=False)
+        node = self.node(tmp_path, learned=False, partial_search='upstream')
         with responses.RequestsMock() as rsps:
             rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
             add_down(rsps, responses.POST, UP_QUERY, None)
@@ -1389,7 +1401,7 @@ class TestUnreachable(PartialNode):
         assert not isinstance(exc.value, NotOnMirrorError)
 
     def test_search_cancel_is_not_degraded(self, tmp_path: Path) -> None:
-        node = self.node(tmp_path)
+        node = self.node(tmp_path, partial_search='upstream')
 
         def cancel_then_fail(_req: object) -> tuple[int, dict[str, str], bytes]:
             node.cancel_active()
