@@ -1458,6 +1458,39 @@ class TestProbeOrigins:
     # =====================================================================
 
 
+class TestGitBool:
+    """Tests for the _git_bool() helper."""
+
+    @pytest.mark.parametrize(
+        'value,expected',
+        [
+            ('true', True),
+            ('TRUE', True),
+            ('yes', True),
+            ('On', True),
+            ('1', True),
+            ('42', True),
+            ('-1', True),
+            ('false', False),
+            ('No', False),
+            ('off', False),
+            ('0', False),
+            ('', False),
+            (' true ', True),
+        ],
+    )
+    def test_git_values(self, value: str, expected: bool) -> None:
+        from liblore.node import _git_bool
+
+        assert _git_bool(value) is expected
+
+    @pytest.mark.parametrize('value', ['maybe', 'tru', '1.5'])
+    def test_unknown_value(self, value: str) -> None:
+        from liblore.node import _git_bool
+
+        assert _git_bool(value) is None
+
+
 class TestFromGitConfig:
     """Tests for LoreNode.from_git_config() with legacy [lore] section.
 
@@ -1546,6 +1579,30 @@ class TestFromGitConfig:
             node = LoreNode.from_git_config()
 
         assert node._probe_timeout == 5.0  # default
+
+    def test_autoprobe_accepts_git_bools(self) -> None:
+        """autoprobe = yes turns probing on, as it would in git."""
+        gitcfg: dict[str, str | list[str]] = {'autoprobe': 'yes'}
+
+        with (
+            patch('liblore.node._get_subsection_config', return_value={}),
+            patch('liblore.node._get_config_from_git', return_value=gitcfg),
+        ):
+            node = LoreNode.from_git_config()
+
+        assert node._auto_probe is True
+
+    def test_invalid_autoprobe_keeps_default(self) -> None:
+        """An autoprobe value git would reject keeps the default."""
+        gitcfg: dict[str, str | list[str]] = {'autoprobe': 'maybe'}
+
+        with (
+            patch('liblore.node._get_subsection_config', return_value={}),
+            patch('liblore.node._get_config_from_git', return_value=gitcfg),
+        ):
+            node = LoreNode.from_git_config()
+
+        assert node._auto_probe is False  # default
 
     def test_custom_url_passed_through(self) -> None:
         """The url argument is forwarded to __init__."""

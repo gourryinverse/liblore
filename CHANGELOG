@@ -30,6 +30,9 @@ v0.10.0 (unreleased)
   with, or None when no answer arrived (connection error, timeout).
   Callers can now tell "not found" (404) apart from "could not be
   reached". Messages are unchanged, and RemoteError('text') still works.
+- Fix the autoprobe git config key ignoring git's other true values.
+  yes, on and 1 now turn probing on, as they would in git. A value git
+  would reject keeps the default.
 
 v0.9.0 (2026-08-12)
 -------------------

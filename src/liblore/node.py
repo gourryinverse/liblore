@@ -171,6 +171,26 @@ def _get_subsection_config(
     return config
 
 
+def _git_bool(value: str) -> bool | None:
+    """Read a git config boolean the way git does.
+
+    ``true``/``yes``/``on`` and ``false``/``no``/``off`` in any case, an
+    empty value (false), or an integer (true unless 0).  A bare key with
+    no ``=`` is already turned into ``'true'`` by the config readers.
+
+    Returns ``None`` for anything else, so the caller keeps its default.
+    """
+    val = value.strip().lower()
+    if val in ('true', 'yes', 'on'):
+        return True
+    if val in ('false', 'no', 'off', ''):
+        return False
+    try:
+        return int(val) != 0
+    except ValueError:
+        return None
+
+
 def _operation_scope(func: Callable[_P, _R]) -> Callable[_P, _R]:
     """Run the decorated LoreNode method as one logical operation.
 
@@ -369,7 +389,11 @@ class LoreNode:
         if 'auto_probe' not in kwargs:
             val = gitcfg.get('autoprobe')
             if isinstance(val, str):
-                kwargs['auto_probe'] = val.lower() == 'true'
+                flag = _git_bool(val)
+                if flag is None:
+                    logger.debug('Ignoring invalid autoprobe value: %r', val)
+                else:
+                    kwargs['auto_probe'] = flag
 
         if 'probe_timeout' not in kwargs:
             val = gitcfg.get('probetimeout')
