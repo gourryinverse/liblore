@@ -1,6 +1,5 @@
 CHANGELOG
-=========
-
+==
 v0.10.0 (unreleased)
 --------------------
 - Add liblore.series for summarising a thread or patch series without
@@ -48,6 +47,31 @@ v0.10.0 (unreleased)
   shared one temporary file, so one write could fail or leave a broken
   file. Each write now uses its own temporary file. clear_cache() also
   removes temporary files left by a process that was killed.
+- Add support for partial mirrors, such as a maintainer's local mirror
+  of the lists they follow. A server that sends X-Archive-Coverage:
+  partial and names its upstream archive in X-Archive-Upstream is
+  remembered, in cache_dir when set. What it doesn't have is fetched
+  from the upstream archive, with the user's git config for that
+  archive. Searches and thread polling stay on the mirror when it has
+  the answer. When the mirror can't be reached, the upstream archive
+  answers; when neither can, NotOnMirrorError (a RemoteError) says so.
+  Servers without these headers, lore.kernel.org included, work as
+  before. Only https://lore.kernel.org is trusted as an upstream by
+  default, and the mirror's User-Agent plus identifier is not sent
+  to it.
+- Add the git config keys followupstream, partialsearch,
+  upstreamholdoff and allowupstream, and the matching LoreNode
+  arguments follow_upstream, partial_search, upstream_holdoff and
+  allowed_upstreams.
+- Add LoreNode.last_source (Source.LOCAL, UPSTREAM or DEGRADED) and
+  LoreNode.upstream_url, so callers can tell the user where answers
+  came from.
+- Add LoreNode.last_as_of, how far the last answer reaches. Pollers
+  should pass it as the next since of get_thread_updates_since()
+  instead of their own clock: a mirror is always a little behind, and
+  a reply that arrives in the gap is otherwise never reported.
+- clear_cache() now also clears the cache of a partial mirror's
+  upstream node, and keeps the saved upstream.
 
 v0.9.0 (2026-08-12)
 -------------------

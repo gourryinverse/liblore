@@ -96,6 +96,16 @@ Supported git config keys:
     useragentplus = 550e8400-e29b-41d4-a716-446655440000
 ```
 
+For any other server, such as a local mirror, put the same keys in a
+section named after its origin (`scheme://host[:port]`, with no path).
+lore.kernel.org also reads this section first, and uses `[lore]` only when
+it is missing:
+
+```ini
+[liblore "http://localhost:11043"]
+    probetimeout = 2.0
+```
+
 All keys are optional. Missing keys, missing git, or any other failure is
 silently ignored. Explicit keyword arguments to `from_git_config()` take
 precedence over git config values.
@@ -194,6 +204,132 @@ never returned -- even in long-running processes.
 Pass `nocache=True` to any cached method to bypass the cache for that call
 (the response is still written back to refresh the entry). Call
 `node.clear_cache()` to remove all cached entries.
+
+#### Partial Mirrors
+
+A *partial mirror* has only some of an archive: for example a
+maintainer's local mirror of the lists they follow. Such a mirror is fast
+on a bad connection, and it keeps working when lore.kernel.org is down.
+But it doesn't have everything, so "not found" from it doesn't mean the
+message doesn't exist.
+
+A partial mirror says so in two response headers:
+
+```
+X-Archive-Coverage: partial; updated=1790000000
+X-Archive-Upstream: https://lore.kernel.org/all/
+```
+
+LoreNode reads them on every answer. There is nothing to configure: point
+the node at the mirror, and it learns the rest.
+
+- **The mirror answers first.** When it doesn't have a thread or a message
+  (a 404), the node asks the upstream archive. The upstream gets its own
+  node, which uses your git config for its origin (fallbacks, probing,
+  timeouts).
+- **Searches stay local.** A search the mirror answers is final. The
+  upstream archive is asked only when the mirror finds nothing. Set
+  `partialsearch = upstream` to ask the upstream archive first, if you want
+  every hit and don't mind the wait.
+- **Polling stays local.** `get_thread_updates_since()` first asks the
+  mirror whether it has the thread (a `HEAD` request). For a thread it has,
+  its "nothing new" is final, and lore.kernel.org is not contacted. For a
+  thread it doesn't have, the upstream archive answers.
+- **Outages.** When the mirror can't be reached, the upstream archive
+  answers. When the upstream can't be reached, the node doesn't try it
+  again for `upstreamholdoff` seconds (default 300), so a command doesn't
+  wait for a timeout on every call.
+- **Remembered.** With `cache_dir` set, the node saves the upstream it
+  learned (in a `*.lore.upstream` file, which `clear_cache()` keeps). So it
+  still works the next time, even when the mirror is stopped.
+
+Servers that don't send these headers, lore.kernel.org included, work
+exactly as before.
+
+**Where answers came from.** `node.last_source` tells you where the
+answer to your last call (in this Python thread) came from:
+
+```python
+from liblore import LoreNode, Source
+
+with LoreNode.from_git_config('http://localhost:11043/lore/all') as node:
+    msgs = node.get_thread_by_msgid('20250101-example@kernel.org')
+    if node.last_source is Source.UPSTREAM:
+        print(f'Not on your mirror, fetched from {node.upstream_url}')
+```
+
+- `Source.LOCAL` -- answered by this node (its server or its cache).
+- `Source.UPSTREAM` -- answered by the upstream archive.
+- `Source.DEGRADED` -- the upstream archive could not be reached, so only
+  the mirror answered, and the answer may be incomplete. Only
+  `partialsearch = upstream` can give this.
+
+It is `None` before the first call and after a call that raised. A batch
+reports the worst source of all its items. To get a source per item, call
+the single-item method in your own loop. On a node that is not a partial
+mirror, every answer is `LOCAL`.
+
+**Polling with `last_as_of`.** A mirror is always a little behind the
+archive it mirrors. Its "nothing new" is true only up to its last update.
+If you poll with your own clock as the next `since`, a reply can fall into
+that gap and never be reported. Instead, use `node.last_as_of`. It tells
+you how far the last answer reaches:
+
+```python
+since = datetime.now(timezone.utc) - timedelta(days=1)
+while True:
+    updates = node.get_thread_updates_since(msgid, since)
+    since = node.last_as_of or since
+    # Polls overlap a little: skip messages you have already seen.
+    ...
+```
+
+This works on every node, not only on partial mirrors. On a full archive,
+`last_as_of` is the time the request was sent.
+
+**When a mirror sends no `updated` time** (it has never finished an
+update), its "nothing new" can't be trusted. Thread updates then come from
+the upstream archive.
+
+**Errors.** When the mirror doesn't have something and the upstream
+archive can't be reached, you get `NotOnMirrorError`. It is a
+`RemoteError`, so code that already handles `RemoteError` keeps working.
+When the upstream archive answers "not found", you get a plain
+`RemoteError` with `status_code == 404`, as from any other server.
+
+**Trust.** A mirror shared over a VPN could name any host as its upstream,
+and your queries would go there. So only `https://lore.kernel.org` is
+trusted by default. Add others with `allowupstream` (multi-valued) in git
+config, or `allowed_upstreams=[...]` in Python. An upstream that isn't
+trusted is ignored, with one warning.
+
+The User-Agent `plus` identifier of the mirror's node (passed to
+`set_user_agent()`, or `useragentplus` in the mirror's git config) is not
+sent to the upstream archive: it identifies you to one server's operator.
+The upstream node uses the `useragentplus` that git config sets for its
+own origin, if any. For lore.kernel.org, that is the one in `[lore]`.
+
+**Caching.** The node caches only its own answers. Answers from the
+upstream archive are cached by the upstream node, so the next call asks
+the mirror again: by then it may have the thread. Answers that may be
+incomplete (`DEGRADED`) are never cached. `clear_cache()` clears both.
+
+The settings go in the git config section of the mirror's origin, and
+`from_git_config()` reads them:
+
+```ini
+[liblore "http://localhost:11043"]
+    partialsearch = upstream
+    upstreamholdoff = 60
+    allowupstream = https://mirror.example.com
+```
+
+| git config key    | `LoreNode` argument | Default                                          |
+|-------------------|---------------------|--------------------------------------------------|
+| `followupstream`  | `follow_upstream`   | `true`; `false` ignores the headers              |
+| `partialsearch`   | `partial_search`    | `local`, or `upstream`                           |
+| `upstreamholdoff` | `upstream_holdoff`  | `300` seconds; `0` asks the upstream every time  |
+| `allowupstream`   | `allowed_upstreams` | none besides `https://lore.kernel.org`           |
 
 #### Fetching Threads
 
@@ -914,10 +1050,14 @@ All exceptions inherit from `LibloreError`, so you can catch them broadly or
 handle specific cases:
 
 ```python
-from liblore import LibloreError, RemoteError, PublicInboxError
+from liblore import LibloreError, NotOnMirrorError, RemoteError, PublicInboxError
 
 try:
     msgs = node.get_thread_by_msgid('nonexistent@example.com')
+except NotOnMirrorError:
+    # A partial mirror doesn't have it, and its upstream archive could not
+    # be reached (see "Partial Mirrors").  Also a RemoteError.
+    ...
 except RemoteError as ex:
     # HTTP request failed (server error, network issue, etc.)
     if ex.status_code == 404:
