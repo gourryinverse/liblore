@@ -170,10 +170,11 @@ class TestClearCache:
         """Left by a killed process: nothing else would ever remove them."""
         orphans = [
             'a.lore.cache.0123456789abcdef.tmp',
+            'b.lore.upstream.0123456789abcdef.tmp',
             # The name that versions before 0.10 used.
             'c.lore.cache.tmp',
         ]
-        kept = ['other.tmp', 'e.lore.cache.notours.tmp']
+        kept = ['d.lore.upstream', 'other.tmp', 'e.lore.cache.notours.tmp']
         for name in orphans + kept:
             (tmp_path / name).write_bytes(b'x')
         old = time.time() - _ORPHAN_TMP_AGE - 1

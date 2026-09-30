@@ -53,6 +53,8 @@ class _LoreNodeInitKwargs(TypedDict, total=False):
     add_auth_headers: bool
     cache_dir: str | None
     cache_ttl: int
+    follow_upstream: bool
+    allowed_upstreams: list[str] | None
 
 
 class _AuthenticateMessage(Protocol):
@@ -192,6 +194,69 @@ def _git_bool(value: str) -> bool | None:
         return None
 
 
+# Upstreams followed without being listed in allowupstream (section 2.4 of
+# the partial mirrors spec).
+_BUILTIN_UPSTREAMS = frozenset({'https://lore.kernel.org'})
+
+# Hosts already warned about, so each untrusted upstream is logged once
+# per process, not once per response.
+_warned_untrusted: set[str] = set()
+_warned_lock = threading.Lock()
+
+
+def _normalize_url(url: str) -> str:
+    """Normalize *url* for comparison.
+
+    Lower-cases the scheme and host, drops the default port (``:80`` for
+    http, ``:443`` for https) and any trailing ``/``.  The path keeps
+    its case.  Raises :class:`ValueError` for a URL without a host, with
+    an invalid port, or with user info (which would otherwise be lost).
+    """
+    parsed = urllib.parse.urlsplit(url.strip())
+    scheme = parsed.scheme.lower()
+    host = parsed.hostname
+    if not scheme or not host:
+        raise ValueError(f'not an absolute URL: {url!r}')
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(f'URL has user info: {url!r}')
+    if ':' in host:  # IPv6 literal: urlsplit() dropped the brackets
+        host = f'[{host}]'
+    port = parsed.port
+    if port is not None and (scheme, port) not in (('http', 80), ('https', 443)):
+        host = f'{host}:{port}'
+    return urllib.parse.urlunsplit(
+        (scheme, host, parsed.path.rstrip('/'), parsed.query, parsed.fragment)
+    )
+
+
+def _url_origin(url: str) -> str:
+    """Return ``scheme://host[:port]`` of an already normalized *url*."""
+    parsed = urllib.parse.urlsplit(url)
+    return f'{parsed.scheme}://{parsed.netloc}'
+
+
+def _parse_coverage(value: str) -> tuple[str, dict[str, str]]:
+    """Split an ``X-Archive-Coverage`` value into its token and parameters.
+
+    ``'partial; updated=1790000000'`` gives
+    ``('partial', {'updated': '1790000000'})``.  Names are lower-cased;
+    a parameter without ``=`` is skipped.
+    """
+    token, *parts = value.split(';')
+    params: dict[str, str] = {}
+    for part in parts:
+        name, sep, val = part.partition('=')
+        if sep:
+            params[name.strip().lower()] = val.strip()
+    return token.strip().lower(), params
+
+
+def _header(resp: requests.Response, name: str) -> str | None:
+    """Return response header *name*, or ``None`` when it is not a string."""
+    value: object = resp.headers.get(name)
+    return value if isinstance(value, str) else None
+
+
 def _operation_scope(func: Callable[_P, _R]) -> Callable[_P, _R]:
     """Run the decorated LoreNode method as one logical operation.
 
@@ -212,7 +277,7 @@ def _operation_scope(func: Callable[_P, _R]) -> Callable[_P, _R]:
 
 # A temporary file _write_atomic() left behind when its process was
 # killed.  Versions before 0.10 named it <file>.tmp.
-_ORPHAN_TMP_RE = re.compile(r'.+\.lore\.cache(?:\.[0-9a-f]{16})?\.tmp')
+_ORPHAN_TMP_RE = re.compile(r'.+\.lore\.(?:cache|upstream)(?:\.[0-9a-f]{16})?\.tmp')
 # A temporary file younger than this may still be in use by a running
 # process, so clear_cache() leaves it alone.
 _ORPHAN_TMP_AGE = 3600
@@ -277,6 +342,8 @@ class LoreNode:
         add_auth_headers: bool = False,
         cache_dir: str | None = None,
         cache_ttl: int = 600,
+        follow_upstream: bool = True,
+        allowed_upstreams: list[str] | None = None,
     ) -> None:
         self._url = url.rstrip('/')
         self._session: requests.Session | None = None
@@ -317,6 +384,35 @@ class LoreNode:
                 )
             self._all_origins.append(fb)
         self._all_origins.append(self._canonical_origin)
+
+        # Partial mirrors: the upstream archive learned from the
+        # X-Archive-* response headers (see _learn_upstream).
+        self._follow_upstream = follow_upstream
+        trusted = set(_BUILTIN_UPSTREAMS)
+        for au in allowed_upstreams or []:
+            try:
+                norm = _normalize_url(au)
+            except ValueError:
+                norm = ''
+            au_parsed = urllib.parse.urlsplit(norm)
+            if (
+                au_parsed.scheme not in ('http', 'https')
+                or au_parsed.path
+                or au_parsed.query
+                or au_parsed.fragment
+            ):
+                raise LibloreError(
+                    f'Invalid allowed upstream (expected scheme://host): {au!r}'
+                )
+            trusted.add(norm)
+        self._trusted_upstreams = frozenset(trusted)
+        try:
+            self._norm_url = _normalize_url(self._url)
+        except ValueError:
+            self._norm_url = self._url
+        self._upstream_lock = threading.Lock()
+        self._upstream_url: str | None = None
+        self._upstream_loaded = False
 
         if cache_dir is not None:
             os.makedirs(cache_dir, exist_ok=True)
@@ -381,6 +477,18 @@ class LoreNode:
             :meth:`set_user_agent` is called without an explicit
             *plus* argument.
 
+        ``followupstream``
+            Boolean.  When ``true`` (the default), a server that says it
+            is a partial mirror (``X-Archive-Coverage: partial``) is
+            remembered together with the upstream archive it names in
+            ``X-Archive-Upstream``.  ``false`` ignores those headers.
+
+        ``allowupstream``
+            Multi-valued.  Each value is an origin (``scheme://host``)
+            to trust as an upstream archive, besides the built-in
+            ``https://lore.kernel.org``.  An upstream that is not
+            trusted is ignored, with one warning per process.
+
         Lookup order:
 
         1. ``[liblore "<origin>"]`` — per-origin subsection
@@ -421,10 +529,12 @@ class LoreNode:
         gitcfg = _get_subsection_config(
             'liblore',
             origin,
-            multivals=['fallback'],
+            multivals=['fallback', 'allowupstream'],
         )
         if not gitcfg and parsed.netloc == 'lore.kernel.org':
-            gitcfg = _get_config_from_git(r'^lore\.', multivals=['fallback'])
+            gitcfg = _get_config_from_git(
+                r'^lore\.', multivals=['fallback', 'allowupstream']
+            )
 
         if 'fallback_urls' not in kwargs:
             fallbacks = gitcfg.get('fallback')
@@ -470,6 +580,20 @@ class LoreNode:
                         kwargs['request_timeout'] = float(val)
                 except ValueError:
                     pass
+
+        if 'follow_upstream' not in kwargs:
+            val = gitcfg.get('followupstream')
+            if isinstance(val, str):
+                flag = _git_bool(val)
+                if flag is None:
+                    logger.debug('Ignoring invalid followupstream value: %r', val)
+                else:
+                    kwargs['follow_upstream'] = flag
+
+        if 'allowed_upstreams' not in kwargs:
+            allowed = gitcfg.get('allowupstream')
+            if isinstance(allowed, list) and allowed:
+                kwargs['allowed_upstreams'] = allowed
 
         node = cls(url, **kwargs)
 
@@ -739,6 +863,137 @@ class LoreNode:
         except OSError:
             logger.debug('Failed to write probe cache: %s', path)
 
+    # -----------------------------------------------------------------
+    # Partial mirrors
+    # -----------------------------------------------------------------
+
+    def _upstream_path(self) -> str | None:
+        """Path of the file that remembers the learned upstream, or None.
+
+        The suffix is not ``.lore.cache``, so :meth:`clear_cache` keeps
+        it: the saved upstream is what lets a stopped mirror fall back.
+        """
+        if self._cache_dir is None:
+            return None
+        key = hashlib.sha256(f'upstream\0{self._url}'.encode()).hexdigest()
+        return os.path.join(self._cache_dir, f'{key}.lore.upstream')
+
+    def _usable_upstream(self, value: str) -> str | None:
+        """Return upstream URL *value*, normalized, if this node may follow it.
+
+        It must be an absolute http or https URL, must not be this node
+        itself, and its origin must be trusted: built in, or listed in
+        *allowed_upstreams*.  An untrusted origin is warned about once
+        per process.
+        """
+        try:
+            norm = _normalize_url(value)
+        except ValueError:
+            norm = ''
+        parsed = urllib.parse.urlsplit(norm)
+        if parsed.scheme not in ('http', 'https') or parsed.query or parsed.fragment:
+            logger.debug('Ignoring invalid upstream URL: %r', value)
+            return None
+        if norm == self._norm_url:
+            return None
+        origin = _url_origin(norm)
+        if origin not in self._trusted_upstreams:
+            with _warned_lock:
+                first = origin not in _warned_untrusted
+                _warned_untrusted.add(origin)
+            if first:
+                logger.warning(
+                    'Not following untrusted upstream %s named by %s '
+                    '(add it to allowupstream to trust it)',
+                    origin,
+                    self._canonical_origin,
+                )
+            return None
+        return norm
+
+    def _load_upstream(self) -> None:
+        """Read the saved upstream, once.  The caller holds _upstream_lock."""
+        if self._upstream_loaded:
+            return
+        self._upstream_loaded = True
+        path = self._upstream_path()
+        if path is None:
+            return
+        try:
+            with open(path, 'rb') as f:
+                data: object = json.loads(f.read())
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError):
+            logger.debug('Ignoring unreadable upstream file: %s', path)
+            return
+        if not isinstance(data, dict):
+            return
+        saved = cast('dict[str, object]', data)
+        upstream = saved.get('upstream')
+        if saved.get('url') != self._url or not isinstance(upstream, str):
+            return
+        # Check it again: allowupstream may have changed since it was saved.
+        self._upstream_url = self._usable_upstream(upstream)
+
+    def _save_upstream(self) -> None:
+        """Write or delete the saved upstream.  The caller holds _upstream_lock."""
+        path = self._upstream_path()
+        if path is None:
+            return
+        if self._upstream_url is None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.debug('Failed to remove upstream file: %s', path)
+            return
+        data = {'url': self._url, 'upstream': self._upstream_url}
+        try:
+            _write_atomic(path, json.dumps(data).encode())
+        except OSError:
+            logger.debug('Failed to write upstream file: %s', path)
+
+    def _learn_upstream(self, resp: requests.Response) -> None:
+        """Learn from *resp* whether this node is a partial mirror.
+
+        A partial mirror sends ``X-Archive-Coverage: partial`` and names
+        the archive it mirrors in ``X-Archive-Upstream``.  A usable
+        upstream is remembered.  Any other answer forgets it, but only
+        for a 2xx, 3xx or 404: a 5xx without the headers may come from a
+        proxy in front of the mirror, not from the mirror.
+        """
+        if not self._follow_upstream:
+            return
+        upstream = None
+        coverage = _header(resp, 'X-Archive-Coverage')
+        if coverage is not None and _parse_coverage(coverage)[0] == 'partial':
+            value = _header(resp, 'X-Archive-Upstream')
+            if value is not None:
+                upstream = self._usable_upstream(value)
+        status = resp.status_code
+        if upstream is None and not (200 <= status < 400 or status == 404):
+            return
+        with self._upstream_lock:
+            self._load_upstream()
+            if upstream == self._upstream_url:
+                return
+            if upstream is not None:
+                logger.debug('%s is a partial mirror of %s', self._url, upstream)
+            else:
+                logger.debug('%s is no longer a partial mirror', self._url)
+            self._upstream_url = upstream
+            self._save_upstream()
+
+    def _get_upstream_url(self) -> str | None:
+        """Return the learned upstream archive URL, or None for a full node."""
+        if not self._follow_upstream:
+            return None
+        with self._upstream_lock:
+            self._load_upstream()
+            return self._upstream_url
+
     def _probe_one(self, origin: str) -> tuple[str, float]:
         """HEAD manifest.js.gz on *origin*, return (origin, elapsed).
 
@@ -890,6 +1145,7 @@ class LoreNode:
                 last_exc = exc
                 continue
 
+            self._learn_upstream(resp)
             if resp.status_code >= 500:
                 logger.warning(
                     'Request to %s returned %d, trying next host',
