@@ -2308,6 +2308,41 @@ class TestCancellation:
         # Item one completed; item two was never fetched.
         assert mock_session.get.call_count == 1
 
+    def test_message_cancel_mid_flight_is_not_remote_error(self) -> None:
+        """A cancel during get_message_by_msgid() raises OperationCancelledError.
+
+        get_message_by_msgid() turns unexpected errors into RemoteError;
+        a cancel must not be one of them, or callers that catch
+        RemoteError would treat the cancel as a server failure.
+        """
+        node = LoreNode('https://lore.kernel.org/all')
+        mock_session = MagicMock()
+
+        def boom(*_args: object, **_kwargs: object) -> object:
+            node.cancel_active()
+            raise requests.ConnectionError('socket closed')
+
+        mock_session.get.side_effect = boom
+        node.set_requests_session(mock_session)
+
+        with pytest.raises(OperationCancelledError):
+            node.get_message_by_msgid('first@example.com')
+
+    def test_validate_cancel_mid_flight_is_not_remote_error(self) -> None:
+        """A cancel during validate() raises OperationCancelledError."""
+        node = LoreNode('https://lore.kernel.org/all')
+        mock_session = MagicMock()
+
+        def boom(*_args: object, **_kwargs: object) -> object:
+            node.cancel_active()
+            raise requests.ConnectionError('socket closed')
+
+        mock_session.head.side_effect = boom
+        node.set_requests_session(mock_session)
+
+        with pytest.raises(OperationCancelledError):
+            node.validate()
+
     def test_nested_operations_join_the_outermost(self) -> None:
         """Nested _operation() scopes share the outer generation."""
         node = LoreNode()

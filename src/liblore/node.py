@@ -1222,7 +1222,9 @@ class LoreNode:
             response = self._request('GET', raw_url)
             response.raise_for_status()
             data: bytes = response.content
-        except RemoteError:
+        except LibloreError:
+            # RemoteError, and OperationCancelledError: a cancel is not
+            # a server failure.
             raise
         except Exception as ex:
             status = None
@@ -1305,6 +1307,9 @@ class LoreNode:
             session = self._get_session()
             resp = session.head(help_url, timeout=self._request_timeout)
         except Exception as ex:
+            # cancel_active() and shutdown() close the session mid-flight.
+            if self._cancelled():
+                raise OperationCancelledError('Request cancelled') from ex
             raise RemoteError(
                 f'Failed to reach public-inbox at {help_url}: {ex}'
             ) from ex

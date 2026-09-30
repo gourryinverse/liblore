@@ -33,6 +33,10 @@ v0.10.0 (unreleased)
 - Fix the autoprobe git config key ignoring git's other true values.
   yes, on and 1 now turn probing on, as they would in git. A value git
   would reject keeps the default.
+- Fix get_message_by_msgid() and validate() raising RemoteError instead
+  of OperationCancelledError when cancel_active() or shutdown() stops
+  them mid-request. Code that catches RemoteError no longer mistakes a
+  cancel for a server failure.
 
 v0.9.0 (2026-08-12)
 -------------------
