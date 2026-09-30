@@ -40,6 +40,17 @@ class RemoteError(LibloreError):
         self.status_code = status_code
 
 
+class NotOnMirrorError(RemoteError):
+    """A partial mirror doesn't have it, and its upstream could not be reached.
+
+    Raised only by a node that knows it is a partial mirror
+    (``X-Archive-Coverage: partial``).  The thing asked for may well
+    exist: the mirror doesn't have it, and the upstream archive that
+    would have it did not answer.  :attr:`status_code` is the
+    upstream's status, or ``None`` when it did not answer at all.
+    """
+
+
 class PublicInboxError(LibloreError):
     """Raised when a public-inbox operation fails."""
 
@@ -53,6 +64,7 @@ from liblore.node import LoreNode
 __all__ = [
     'LibloreError',
     'LoreNode',
+    'NotOnMirrorError',
     'OperationCancelledError',
     'PublicInboxError',
     'RemoteError',

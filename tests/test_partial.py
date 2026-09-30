@@ -18,7 +18,12 @@ import pytest
 import requests
 import responses
 
-from liblore import LibloreError, OperationCancelledError, RemoteError
+from liblore import (
+    LibloreError,
+    NotOnMirrorError,
+    OperationCancelledError,
+    RemoteError,
+)
 from liblore.node import (
     LoreNode,
     _LoreNodeInitKwargs,
@@ -42,8 +47,11 @@ OTHER = {**PARTIAL, 'X-Archive-Upstream': 'https://mirror.example.com/all'}
 
 @pytest.fixture(autouse=True)
 def _reset_warnings() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
-    """Each test starts with no "untrusted upstream" warning given yet."""
-    with patch('liblore.node._warned_untrusted', set[str]()):
+    """Each test starts with no "untrusted upstream" or outage warning given yet."""
+    with (
+        patch('liblore.node._warned_untrusted', set[str]()),
+        patch('liblore.node._warned_outage', set[tuple[str, str]]()),
+    ):
         yield
 
 
@@ -761,7 +769,9 @@ def urls(rsps: responses.RequestsMock) -> list[tuple[str, str | None]]:
     return [(c.request.method or '', c.request.url) for c in rsps.calls]
 
 
-class TestMissRules:
+class PartialNode:
+    """Shared setup: no git config, and a node on the local mirror."""
+
     @pytest.fixture(autouse=True)
     def _git_config(self) -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
         with (
@@ -789,6 +799,8 @@ class TestMissRules:
             fetch(node, headers=PARTIAL)
         return node
 
+
+class TestMissRules(PartialNode):
     # --- get_mbox_by_msgid / get_thread_by_msgid ---------------------
 
     def test_mbox_hit_is_local(self, tmp_path: Path, sample_mbox: bytes) -> None:
@@ -856,6 +868,7 @@ class TestMissRules:
             with pytest.raises(RemoteError) as exc:
                 node.get_mbox_by_msgid(MSGID)
             assert exc.value.status_code == 404
+            assert not isinstance(exc.value, NotOnMirrorError)
             assert len(rsps.calls) == 3
 
     def test_full_node_keeps_redirect_lookup(self, tmp_path: Path) -> None:
@@ -973,6 +986,7 @@ class TestMissRules:
             with pytest.raises(RemoteError) as exc:
                 node.get_message_by_msgid(MSGID)
             assert exc.value.status_code == 404
+            assert not isinstance(exc.value, NotOnMirrorError)
 
     def test_raw_other_4xx_not_a_miss(self, tmp_path: Path) -> None:
         node = self.node(tmp_path)
@@ -1002,6 +1016,7 @@ class TestMissRules:
             with pytest.raises(RemoteError) as exc:
                 node.get_mbox_by_query('test')
             assert exc.value.status_code == 404
+            assert not isinstance(exc.value, NotOnMirrorError)
             assert urls(rsps) == [('POST', UP_QUERY)]
 
     def test_search_learned_from_same_answer(
@@ -1156,3 +1171,335 @@ class TestMissRules:
             with pytest.raises(RemoteError):
                 node.validate()
             assert len(rsps.calls) == 1
+
+
+# =====================================================================
+# L4: unreachable nodes
+# =====================================================================
+
+LOCAL_HOST = '127.0.0.1:11043'
+
+
+def add_down(
+    rsps: responses.RequestsMock, method: str, url: str, status: int | None
+) -> None:
+    """Make *url* unreachable: a connection error, or a *status* 5xx."""
+    if status is None:
+        rsps.add(method, url, body=requests.ConnectionError('Connection refused'))
+    else:
+        rsps.add(method, url, status=status)
+
+
+def warnings_about(caplog: pytest.LogCaptureFixture, text: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and text in r.getMessage()
+    ]
+
+
+# A connection error (no status at all) and a 5xx both mean "unreachable".
+DOWN = pytest.mark.parametrize('status', [None, 503])
+
+
+class TestUnreachable(PartialNode):
+    # --- a local miss, and the upstream is unreachable ---------------
+
+    @DOWN
+    def test_mbox_miss_upstream_down(self, tmp_path: Path, status: int | None) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            add_down(rsps, responses.GET, UP_MBOX, status)
+            with pytest.raises(NotOnMirrorError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+        # Callers that catch RemoteError keep working.
+        assert isinstance(exc.value, RemoteError)
+        assert exc.value.status_code == status
+        msg = str(exc.value)
+        assert MSGID in msg
+        assert LOCAL_HOST in msg
+        assert 'lore.kernel.org' in msg
+
+    @DOWN
+    def test_raw_miss_upstream_down(self, tmp_path: Path, status: int | None) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            add_down(rsps, responses.GET, UP_RAW, status)
+            with pytest.raises(NotOnMirrorError) as exc:
+                node.get_message_by_msgid(MSGID)
+        assert exc.value.status_code == status
+
+    def test_thread_miss_upstream_down(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            add_down(rsps, responses.GET, UP_MBOX, None)
+            with pytest.raises(NotOnMirrorError):
+                node.get_thread_by_msgid(MSGID)
+
+    # --- the local mirror is unreachable -----------------------------
+
+    @DOWN
+    def test_mbox_local_down_uses_upstream(
+        self, tmp_path: Path, sample_mbox: bytes, status: int | None
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.GET, LOCAL_MBOX, status)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            assert urls(rsps) == [('GET', LOCAL_MBOX), ('GET', UP_MBOX)]
+
+    @DOWN
+    def test_raw_local_down_uses_upstream(
+        self, tmp_path: Path, status: int | None
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.GET, LOCAL_RAW, status)
+            rsps.add(responses.GET, UP_RAW, body=LOCAL_MSG)
+            assert node.get_message_by_msgid(MSGID) == LOCAL_MSG
+            assert urls(rsps) == [('GET', LOCAL_RAW), ('GET', UP_RAW)]
+
+    def test_local_down_warns_once(
+        self, tmp_path: Path, sample_mbox: bytes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = self.node(tmp_path)
+        with (
+            caplog.at_level(logging.WARNING, logger='liblore.node'),
+            responses.RequestsMock() as rsps,
+        ):
+            add_down(rsps, responses.GET, LOCAL_MBOX, None)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+            node.get_mbox_by_msgid(MSGID)
+            # Local is tried every time: it may be back.
+            assert urls(rsps).count(('GET', LOCAL_MBOX)) == 2
+        warned = warnings_about(caplog, 'unreachable')
+        assert len(warned) == 1
+        assert LOCAL_HOST in warned[0]
+        assert 'lore.kernel.org' in warned[0]
+
+    def test_local_down_saved_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # An earlier run learned the upstream; a stopped mirror sends no
+        # headers to learn from.
+        self.node(tmp_path)
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.GET, LOCAL_MBOX, None)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+
+    @DOWN
+    def test_local_down_no_upstream(self, tmp_path: Path, status: int | None) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.GET, LOCAL_MBOX, status)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps) == [('GET', LOCAL_MBOX)]
+        assert not isinstance(exc.value, NotOnMirrorError)
+        assert exc.value.status_code == status
+
+    def test_both_down(self, tmp_path: Path) -> None:
+        # Nothing says the thread is missing locally, so this is no
+        # NotOnMirrorError: the upstream's error is raised as it is.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.GET, LOCAL_MBOX, None)
+            add_down(rsps, responses.GET, UP_MBOX, 503)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+        assert not isinstance(exc.value, NotOnMirrorError)
+        assert exc.value.status_code == 503
+
+    # --- whole-archive search ----------------------------------------
+
+    @DOWN
+    def test_search_upstream_down_is_degraded(
+        self,
+        tmp_path: Path,
+        sample_mbox: bytes,
+        caplog: pytest.LogCaptureFixture,
+        status: int | None,
+    ) -> None:
+        node = self.node(tmp_path)
+        with (
+            caplog.at_level(logging.WARNING, logger='liblore.node'),
+            responses.RequestsMock() as rsps,
+        ):
+            add_down(rsps, responses.POST, UP_QUERY, status)
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', UP_QUERY), ('POST', LOCAL_QUERY)]
+        # The answer may be incomplete: never cached.
+        key = node._cache_key('mbox_by_query', 'test', 'False')
+        assert node._cache_read(key) is None
+        assert len(warnings_about(caplog, 'incomplete')) == 1
+
+    def test_search_learned_then_upstream_down(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # The mirror's own answer says it is partial, and then the
+        # upstream can't be reached: the answer is degraded, not cached.
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY), ('POST', UP_QUERY)]
+        key = node._cache_key('mbox_by_query', 'test', 'False')
+        assert node._cache_read(key) is None
+
+    @pytest.mark.parametrize(('status', 'body'), [(404, b''), (200, gz(b''))])
+    def test_search_upstream_down_nothing_local(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        status: int,
+        body: bytes,
+    ) -> None:
+        # A partial mirror finding nothing says nothing about the archive.
+        node = self.node(tmp_path)
+        with (
+            caplog.at_level(logging.WARNING, logger='liblore.node'),
+            responses.RequestsMock() as rsps,
+        ):
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            rsps.add(
+                responses.POST, LOCAL_QUERY, status=status, body=body, headers=PARTIAL
+            )
+            with pytest.raises(NotOnMirrorError) as exc:
+                node.get_mbox_by_query('test')
+        assert "No results for 'test'" in str(exc.value)
+        # Nothing was returned, so nothing is "incomplete".
+        assert not warnings_about(caplog, 'incomplete')
+
+    def test_search_both_down(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            add_down(rsps, responses.POST, LOCAL_QUERY, None)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_query('test')
+        assert not isinstance(exc.value, NotOnMirrorError)
+
+    def test_search_cancel_is_not_degraded(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+
+        def cancel_then_fail(_req: object) -> tuple[int, dict[str, str], bytes]:
+            node.cancel_active()
+            raise requests.ConnectionError('Connection aborted')
+
+        with responses.RequestsMock() as rsps:
+            rsps.add_callback(responses.POST, UP_QUERY, callback=cancel_then_fail)
+            with pytest.raises(OperationCancelledError):
+                node.get_mbox_by_query('test')
+            # No local search after the cancel.
+            assert urls(rsps) == [('POST', UP_QUERY)]
+
+    @pytest.mark.parametrize(('status', 'body'), [(404, b''), (200, gz(b''))])
+    def test_search_local_mode_miss_upstream_down(
+        self, tmp_path: Path, status: int, body: bytes
+    ) -> None:
+        node = self.node(tmp_path, partial_search='local')
+        with responses.RequestsMock() as rsps:
+            rsps.add(
+                responses.POST, LOCAL_QUERY, status=status, body=body, headers=PARTIAL
+            )
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_query('test')
+            assert urls(rsps) == [('POST', LOCAL_QUERY), ('POST', UP_QUERY)]
+
+    @DOWN
+    def test_search_local_mode_local_down_uses_upstream(
+        self, tmp_path: Path, sample_mbox: bytes, status: int | None
+    ) -> None:
+        node = self.node(tmp_path, partial_search='local')
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, LOCAL_QUERY, status)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY), ('POST', UP_QUERY)]
+
+    def test_search_local_mode_other_4xx_is_raised(self, tmp_path: Path) -> None:
+        # Only "no results" is a miss; a bad query is a bad query anywhere.
+        node = self.node(tmp_path, partial_search='local')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, status=400, headers=PARTIAL)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_query('test')
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+        assert exc.value.status_code == 400
+
+    # --- thread updates ----------------------------------------------
+
+    @DOWN
+    def test_since_check_down_uses_upstream(
+        self, tmp_path: Path, sample_mbox: bytes, status: int | None
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.HEAD, LOCAL_RAW, status)
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', UP_SINCE)]
+
+    @DOWN
+    def test_since_search_down_uses_upstream(
+        self, tmp_path: Path, sample_mbox: bytes, status: int | None
+    ) -> None:
+        # The mirror knows the thread, then fails on the search itself.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            add_down(rsps, responses.POST, LOCAL_SINCE, status)
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
+            assert urls(rsps) == [
+                ('HEAD', LOCAL_RAW),
+                ('POST', LOCAL_SINCE),
+                ('POST', UP_SINCE),
+            ]
+
+    @DOWN
+    def test_since_unknown_thread_upstream_down(
+        self, tmp_path: Path, status: int | None
+    ) -> None:
+        # "Nothing new" would be a guess.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, status=404, headers=PARTIAL)
+            add_down(rsps, responses.POST, UP_SINCE, status)
+            with pytest.raises(NotOnMirrorError) as exc:
+                node.get_thread_updates_since(MSGID, SINCE)
+        assert MSGID in str(exc.value)
+
+    def test_since_both_down(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.HEAD, LOCAL_RAW, None)
+            add_down(rsps, responses.POST, UP_SINCE, None)
+            with pytest.raises(RemoteError) as exc:
+                node.get_thread_updates_since(MSGID, SINCE)
+        assert not isinstance(exc.value, NotOnMirrorError)
+
+    def test_full_node_since_5xx_is_nothing_new(self, tmp_path: Path) -> None:
+        # Unchanged: a full node has always read a 5xx as "nothing new".
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_SINCE, status=503)
+            assert node.get_thread_updates_since(MSGID, SINCE) == []
+
+    def test_full_node_since_connection_error_raises(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, LOCAL_SINCE, None)
+            with pytest.raises(RemoteError) as exc:
+                node.get_thread_updates_since(MSGID, SINCE)
+        assert not isinstance(exc.value, NotOnMirrorError)

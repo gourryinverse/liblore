@@ -25,7 +25,12 @@ from typing import TYPE_CHECKING, Protocol, TypedDict, cast
 
 import requests
 
-from liblore import LibloreError, OperationCancelledError, RemoteError
+from liblore import (
+    LibloreError,
+    NotOnMirrorError,
+    OperationCancelledError,
+    RemoteError,
+)
 from liblore.utils import (
     get_strict_thread,
     sort_msgs_by_received,
@@ -205,18 +210,51 @@ _PARTIAL_SEARCH_MODES = ('upstream', 'local')
 # Hosts already warned about, so each untrusted upstream is logged once
 # per process, not once per response.
 _warned_untrusted: set[str] = set()
+# Outages already warned about, as (kind, node URL).
+_warned_outage: set[tuple[str, str]] = set()
 _warned_lock = threading.Lock()
+
+
+def _warn_outage_once(kind: str, url: str, msg: str, *args: object) -> None:
+    """Log warning *msg* the first time this process sees *kind* for *url*."""
+    with _warned_lock:
+        first = (kind, url) not in _warned_outage
+        _warned_outage.add((kind, url))
+    if first:
+        logger.warning(msg, *args)
+
+
+def _unreachable(ex: RemoteError) -> bool:
+    """Whether *ex* means the server gave no usable answer.
+
+    That is no answer at all (connection error, timeout), or a 5xx: a
+    mirror answering 503 while it restarts is as good as a stopped one.
+    """
+    return ex.status_code is None or ex.status_code >= 500
 
 
 class _Miss(Exception):
     """This partial mirror doesn't have what was asked (see :meth:`LoreNode._answer`).
 
-    *upstream* is the node to ask instead.
+    *upstream* is the node to ask instead.  *answer* is what the mirror
+    did answer, when there was an answer worth keeping should the
+    upstream turn out to be unreachable: a whole-archive search finds
+    some of the hits, or none.  *missing* starts the
+    :class:`~liblore.NotOnMirrorError` message, when the default
+    ``'<what> is not'`` doesn't read well.
     """
 
-    def __init__(self, upstream: LoreNode) -> None:
+    def __init__(
+        self,
+        upstream: LoreNode,
+        answer: object = None,
+        *,
+        missing: str | None = None,
+    ) -> None:
         super().__init__(f'not on the mirror, asking {upstream.url}')
         self.upstream = upstream
+        self.answer = answer
+        self.missing = missing
 
 
 def _normalize_url(url: str) -> str:
@@ -868,6 +906,11 @@ class LoreNode:
         return urllib.parse.urlparse(self._url).hostname or self._url
 
     @property
+    def _netloc(self) -> str:
+        """``host[:port]`` of the URL, for messages."""
+        return urllib.parse.urlsplit(self._url).netloc or self._url
+
+    @property
     def origins(self) -> list[str]:
         """All configured origins in current probe order.
 
@@ -1152,6 +1195,53 @@ class LoreNode:
             raise OperationCancelledError('Request cancelled')
         return upstream
 
+    def _outage_node(self, ex: RemoteError) -> LoreNode | None:
+        """Return the upstream node to use because this node failed with *ex*.
+
+        Returns ``None`` when *ex* is a real answer (see
+        :func:`_unreachable`) or no upstream is known.  The upstream
+        may come from the saved file of an earlier run: an unreachable
+        node sends no headers to learn from.
+        """
+        if not _unreachable(ex):
+            return None
+        upstream = self._fallback_node()
+        if upstream is not None:
+            _warn_outage_once(
+                'local',
+                self._url,
+                'Local mirror %s unreachable (%s), using %s',
+                self._netloc,
+                ex,
+                upstream._netloc,
+            )
+        return upstream
+
+    def _warn_degraded(self, upstream: LoreNode, ex: RemoteError) -> None:
+        _warn_outage_once(
+            'degraded',
+            upstream.url,
+            '%s unreachable (%s), searching the local mirror %s only; '
+            'results may be incomplete',
+            upstream._netloc,
+            ex,
+            self._netloc,
+        )
+
+    def _not_on_mirror(
+        self, upstream: LoreNode, missing: str, ex: RemoteError
+    ) -> NotOnMirrorError:
+        """Build the error for *missing* locally with *upstream* failing with *ex*.
+
+        *missing* reads as the start of a sentence, for example
+        ``'<msgid> is not'``.
+        """
+        return NotOnMirrorError(
+            f'{missing} on the local mirror ({self._netloc}), '
+            f'and {upstream._netloc} could not be reached: {ex}',
+            status_code=ex.status_code,
+        )
+
     def _answer(
         self,
         what: str,
@@ -1159,36 +1249,100 @@ class LoreNode:
         remote: Callable[[LoreNode], _T],
         *,
         upstream_first: bool = False,
+        on_outage: Callable[[RemoteError], _T] | None = None,
     ) -> _T:
         """Answer from this node, or from the upstream archive.
 
-        This is the one place the retry rules of the partial mirrors
-        spec live.  *what* names the thing asked for, for log messages.
+        This is the one place the rules of section 4.5 of the partial
+        mirrors spec live.  *what* names the thing asked for, for log
+        and error messages.
 
-        *local* asks this node.  It returns its answer, or raises
-        :class:`_Miss` when this partial mirror doesn't have *what*.
-        *remote* asks the upstream node the same thing.  A miss goes to
-        the upstream.
+        *local* asks this node.  It returns its answer; or it raises
+        :class:`_Miss` when this partial mirror doesn't have *what*; or
+        :class:`~liblore.RemoteError` when the node failed.  *remote*
+        asks the upstream node the same thing.
 
-        With *upstream_first*, the upstream is asked before this node.
+        A miss goes to the upstream.  When the upstream is unreachable
+        too, the answer the mirror did give is returned if there is
+        one, and :class:`~liblore.NotOnMirrorError` is raised if not.
+
+        When this node is unreachable and an upstream is known, the
+        upstream answers.  With no upstream, *on_outage* answers for
+        the node when given, and the error is raised when not.
+
+        With *upstream_first*, the upstream is asked before this node,
+        and this node only when the upstream is unreachable.
         """
         if upstream_first:
             upstream = self._fallback_node()
             if upstream is not None:
                 logger.debug('Asking %s first for %s', upstream.url, what)
-                return remote(upstream)
+                try:
+                    return remote(upstream)
+                except RemoteError as ex:
+                    if not _unreachable(ex):
+                        raise
+                    return self._degraded(upstream, what, local, ex)
         try:
             return local()
         except _Miss as miss:
             return self._after_miss(miss, what, remote)
+        except RemoteError as ex:
+            upstream = self._outage_node(ex)
+            if upstream is None:
+                if on_outage is not None and _unreachable(ex):
+                    return on_outage(ex)
+                raise
+            return remote(upstream)
 
     def _after_miss(
         self, miss: _Miss, what: str, remote: Callable[[LoreNode], _T]
     ) -> _T:
-        """Ask the upstream for *what*, which this partial mirror doesn't have."""
+        """Ask the upstream for *what*, which this partial mirror doesn't have.
+
+        An unreachable upstream leaves the mirror's own answer, if
+        *miss* carries one, as the degraded answer; otherwise it raises
+        :class:`~liblore.NotOnMirrorError`.  The upstream's real
+        answers, a 404 included, are raised as they are.
+        """
         upstream = miss.upstream
         logger.debug('%s not on %s, asking %s', what, self._url, upstream.url)
-        return remote(upstream)
+        try:
+            return remote(upstream)
+        except RemoteError as ex:
+            if not _unreachable(ex):
+                raise
+            if not miss.answer:
+                missing = miss.missing or f'{what} is not'
+                raise self._not_on_mirror(upstream, missing, ex) from ex
+            self._warn_degraded(upstream, ex)
+            return cast('_T', miss.answer)
+
+    def _degraded(
+        self,
+        upstream: LoreNode,
+        what: str,
+        local: Callable[[], _T],
+        upstream_error: RemoteError,
+    ) -> _T:
+        """Ask this partial mirror for *what* because *upstream* is unreachable.
+
+        The answer may be incomplete, so the caller must not cache it.
+        When the mirror has nothing, that says nothing about the
+        archive: raise :class:`~liblore.NotOnMirrorError` instead.
+        """
+        missing = None
+        try:
+            answer = local()
+        except _Miss as miss:
+            answer, missing = cast('_T', miss.answer), miss.missing
+        if not answer:
+            missing = missing or f'{what} is not'
+            raise self._not_on_mirror(
+                upstream, missing, upstream_error
+            ) from upstream_error
+        self._warn_degraded(upstream, upstream_error)
+        return answer
 
     def _known_locally(self, msgid: str) -> bool:
         """Ask this node whether it has the message *msgid*.
@@ -1196,10 +1350,16 @@ class LoreNode:
         A thread-scoped search for a message-id the server doesn't
         know searches the whole archive instead (public-inbox drops
         the thread limit), so a partial node checks before searching.
+        Raises :class:`RemoteError` when this node is unreachable.
         """
         raw_url = f'{self._url}/{urllib.parse.quote_plus(msgid)}/raw'
         resp = self._request('HEAD', raw_url, allow_redirects=False)
         resp.close()
+        if resp.status_code >= 500:
+            raise RemoteError(
+                f'Server returned an error: {resp.status_code}',
+                status_code=resp.status_code,
+            )
         return resp.status_code != 404
 
     def _probe_one(self, origin: str) -> tuple[str, float]:
@@ -1477,7 +1637,8 @@ class LoreNode:
         instead of ``https://lore.kernel.org/all``).
 
         On a partial mirror, a thread the mirror doesn't have comes from
-        the upstream archive.
+        the upstream archive.  :class:`~liblore.NotOnMirrorError` means
+        the upstream could not be reached either.
         """
         key = self._cache_key('mbox_by_msgid', msgid)
         if not nocache:
@@ -1594,10 +1755,12 @@ class LoreNode:
                 upstream = self._fallback_node()
                 if upstream is None or ex.status_code != 404:
                     raise
-                raise _Miss(upstream) from ex
+                raise _Miss(upstream, missing=f'No results for {query!r}') from ex
             upstream = self._fallback_node()
             if upstream is not None and (upstream_first or not t_mbox):
-                raise _Miss(upstream)
+                # The mirror's answer, which may be incomplete: never
+                # cached.
+                raise _Miss(upstream, t_mbox, missing=f'No results for {query!r}')
             self._cache_write(key, t_mbox)
             return t_mbox
 
@@ -1701,6 +1864,11 @@ class LoreNode:
         whole mirror instead of one thread, so it goes to the upstream
         archive and the mirror is not searched.  For a thread the
         mirror has, its answer is final, even when it is "nothing new".
+
+        When the partial mirror is unreachable, the upstream archive
+        answers.  When the mirror doesn't have the thread and the
+        upstream is unreachable, :class:`~liblore.NotOnMirrorError` is
+        raised: "nothing new" would be a guess.
         """
 
         def remote(upstream: LoreNode) -> list[EmailMessage]:
@@ -1720,17 +1888,32 @@ class LoreNode:
                     raise _Miss(upstream)
             return msgs
 
-        return self._answer(f'Thread {msgid}', local, remote)
+        def on_outage(ex: RemoteError) -> list[EmailMessage]:
+            if ex.status_code is None:
+                raise ex
+            # Every origin answered 5xx: a full node has always reported
+            # that as "nothing new".
+            return []
+
+        return self._answer(f'Thread {msgid}', local, remote, on_outage=on_outage)
 
     def _search_thread(self, msgid: str, query_fragment: str) -> list[EmailMessage]:
         """Run the thread-scoped search on this node.
 
-        Returns an empty list when the server finds no matches.
+        Returns an empty list when the server finds no matches.  Raises
+        :class:`RemoteError` when the server is unreachable, 5xx
+        included.
         """
         qmsgid = urllib.parse.quote_plus(msgid)
         query = urllib.parse.quote_plus(query_fragment)
         search_url = f'{self._url}/{qmsgid}/?x=m&q={query}'
         resp = self._request('POST', search_url, raise_on_error=False, data='')
+        if resp.status_code >= 500:
+            resp.close()
+            raise RemoteError(
+                f'Server returned an error: {resp.status_code}',
+                status_code=resp.status_code,
+            )
         if resp.status_code != 200:
             return []
         t_mbox = gzip.decompress(resp.content)
@@ -1748,7 +1931,8 @@ class LoreNode:
         """Run :meth:`_search_thread` on *upstream*, as one operation.
 
         The upstream is a full archive, so it needs no known-thread
-        check.
+        check, and its 5xx answers raise instead of reading as
+        "nothing new".
         """
         with upstream._operation():
             return upstream._search_thread(msgid, query_fragment)
@@ -1822,7 +2006,8 @@ class LoreNode:
         """Fetch a single raw email message by message ID.
 
         On a partial mirror, a message the mirror doesn't have comes
-        from the upstream archive.
+        from the upstream archive.  :class:`~liblore.NotOnMirrorError`
+        means the upstream could not be reached either.
         """
         key = self._cache_key('message_by_msgid', msgid)
         if not nocache:
