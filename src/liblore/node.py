@@ -1753,9 +1753,16 @@ class LoreNode:
     def clear_cache(self) -> None:
         """Remove all cache files from *cache_dir*.
 
-        Temporary files left by a killed process are removed too, once
-        they are old enough that no running write can still own them.
+        Also clears the cache of the upstream nodes of a partial mirror.
+        The saved upstream (``*.lore.upstream``) is kept: it is what
+        this node learned, not a cached answer.  Temporary files left by
+        a killed process are removed too, once they are old enough that
+        no running write can still own them.
         """
+        # Today the upstream nodes share this node's cache_dir, so this
+        # clears nothing more; it keeps working if they ever don't.
+        for node in self._upstream_nodes():
+            node.clear_cache()
         if self._cache_dir is None:
             return
         now = time.time()

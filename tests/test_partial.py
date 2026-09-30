@@ -2106,3 +2106,147 @@ class TestProvenance(PartialNode):
     def test_upstream_url_not_followed(self, tmp_path: Path) -> None:
         node = self.node(tmp_path, follow_upstream=False)
         assert node.upstream_url is None
+
+
+# =====================================================================
+# L6: cache rules
+# =====================================================================
+
+
+def cached(node: LoreNode, namespace: str, *parts: str) -> bool:
+    """Whether *node* has a fresh cache entry for these key parts."""
+    return node._cache_read(node._cache_key(namespace, *parts)) is not None
+
+
+class TestCacheRules(PartialNode):
+    def upstream(self, node: LoreNode) -> LoreNode:
+        up = node._get_upstream_node()
+        assert up is not None
+        return up
+
+    def test_local_answer_cached_here(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=PARTIAL)
+            node.get_mbox_by_msgid(MSGID)
+        assert cached(node, 'mbox_by_msgid', MSGID)
+        assert not cached(self.upstream(node), 'mbox_by_msgid', MSGID)
+
+    def test_mbox_upstream_answer_cached_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        assert not cached(node, 'mbox_by_msgid', MSGID)
+        assert cached(self.upstream(node), 'mbox_by_msgid', MSGID)
+
+    def test_raw_upstream_answer_cached_upstream(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_RAW, body=LOCAL_MSG)
+            node.get_message_by_msgid(MSGID)
+            # Local is asked again; the upstream node answers from its
+            # own cache.
+            assert node.get_message_by_msgid(MSGID) == LOCAL_MSG
+            assert urls(rsps) == [
+                ('GET', LOCAL_RAW),
+                ('GET', UP_RAW),
+                ('GET', LOCAL_RAW),
+            ]
+        assert not cached(node, 'message_by_msgid', MSGID)
+        assert cached(self.upstream(node), 'message_by_msgid', MSGID)
+
+    def test_search_upstream_answer_cached_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, status=404, headers=PARTIAL)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            node.get_mbox_by_query('test')
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [
+                ('POST', LOCAL_QUERY),
+                ('POST', UP_QUERY),
+                ('POST', LOCAL_QUERY),
+            ]
+        assert not cached(node, 'mbox_by_query', 'test', 'False')
+        assert cached(self.upstream(node), 'mbox_by_query', 'test', 'False')
+
+    def test_mirror_catches_up(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        # The importer pulled the thread after the first call: the next
+        # answer is local, and it is the one cached here.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(b'from upstream'))
+            node.get_mbox_by_msgid(MSGID)
+            rsps.replace(
+                responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=PARTIAL
+            )
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            assert source_of(node) is Source.LOCAL
+            # And from now on it comes from this node's cache.
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            assert urls(rsps).count(('GET', LOCAL_MBOX)) == 2
+        assert source_of(node) is Source.LOCAL
+
+    def test_degraded_cached_nowhere(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, partial_search='upstream', upstream_holdoff=0)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b'partial'), headers=PARTIAL)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            assert node.get_mbox_by_query('test') == b'partial'
+            assert not cached(node, 'mbox_by_query', 'test', 'False')
+            assert not cached(self.upstream(node), 'mbox_by_query', 'test', 'False')
+            # Once the upstream is back, it answers.
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps).count(('POST', UP_QUERY)) == 2
+
+    def test_clear_cache_clears_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        node.clear_cache()
+        assert not cached(self.upstream(node), 'mbox_by_msgid', MSGID)
+        # The saved upstream is not a cache entry.
+        assert len(upstream_files(tmp_path)) == 1
+        assert node.upstream_url == UPSTREAM
+
+    def test_clear_cache_clears_upstream_elsewhere(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # Guards a future where the upstream node has its own cache_dir,
+        # or clear_cache removes only this node's entries.
+        node = self.node(tmp_path / 'here')
+        up = self.upstream(node)
+        (tmp_path / 'there').mkdir()
+        up._cache_dir = str(tmp_path / 'there')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        assert cached(up, 'mbox_by_msgid', MSGID)
+        node.clear_cache()
+        assert not cached(up, 'mbox_by_msgid', MSGID)
+
+    def test_clear_cache_old_upstream_nodes(self, tmp_path: Path) -> None:
+        # An upstream node replaced by a newer one may still hold entries.
+        node = self.node(tmp_path / 'here')
+        old = self.upstream(node)
+        old._cache_dir = str(tmp_path / 'old')
+        (tmp_path / 'old').mkdir()
+        (tmp_path / 'old' / 'x.lore.cache').write_bytes(b'x')
+        node._old_upstream_nodes.append(old)
+        node._upstream_node = None
+        node.clear_cache()
+        assert not (tmp_path / 'old' / 'x.lore.cache').exists()
