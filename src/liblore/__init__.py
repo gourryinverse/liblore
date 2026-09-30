@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import email.charset
 import email.policy
+import enum
 from email.message import EmailMessage
 
 __version__ = '0.9.0'
@@ -51,6 +52,28 @@ class NotOnMirrorError(RemoteError):
     """
 
 
+class Source(enum.Enum):
+    """Where an answer came from, as :attr:`LoreNode.last_source` reports it.
+
+    ``LOCAL``
+        Answered by this node: its server, or its cache.  On a node
+        that is not a partial mirror, such as lore.kernel.org itself,
+        every answer is ``LOCAL``: the word means "this node", not "a
+        local mirror".
+    ``UPSTREAM``
+        Answered by the upstream archive of a partial mirror, because
+        the mirror didn't have it or could not be reached.
+    ``DEGRADED``
+        Answered by a partial mirror because its upstream archive could
+        not be reached, so it may be incomplete.  Only upstream-first
+        searches (``partial_search='upstream'``) give it.
+    """
+
+    LOCAL = 'local'
+    UPSTREAM = 'upstream'
+    DEGRADED = 'degraded'
+
+
 class PublicInboxError(LibloreError):
     """Raised when a public-inbox operation fails."""
 
@@ -68,6 +91,7 @@ __all__ = [
     'OperationCancelledError',
     'PublicInboxError',
     'RemoteError',
+    'Source',
     '__version__',
     'emlpolicy',
 ]

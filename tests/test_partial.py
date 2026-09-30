@@ -24,6 +24,7 @@ from liblore import (
     NotOnMirrorError,
     OperationCancelledError,
     RemoteError,
+    Source,
 )
 from liblore.node import (
     LoreNode,
@@ -1860,3 +1861,248 @@ class TestHoldOff(PartialNode):
                 with pytest.raises(NotOnMirrorError):
                     node.get_mbox_by_msgid(MSGID)
             assert urls(rsps).count(('GET', UP_MBOX)) == 2
+
+
+# =====================================================================
+# L5: provenance
+# =====================================================================
+
+
+def source_of(node: LoreNode) -> Source | None:
+    """Read ``last_source`` fresh, so mypy doesn't narrow it between calls."""
+    return node.last_source
+
+
+class TestProvenance(PartialNode):
+    def test_exported(self) -> None:
+        import liblore
+
+        assert 'Source' in liblore.__all__
+
+    def test_none_before_first_call(self) -> None:
+        assert source_of(LoreNode(LOCAL)) is None
+
+    def test_full_node_is_local(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        # "Local" means "this node", even on lore.kernel.org itself.
+        node = LoreNode(UPSTREAM, cache_dir=str(tmp_path))
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        assert source_of(node) is Source.LOCAL
+
+    def test_mbox_hit(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=PARTIAL)
+            node.get_mbox_by_msgid(MSGID)
+        assert source_of(node) is Source.LOCAL
+
+    def test_mbox_miss(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_raw_miss(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_RAW, body=LOCAL_MSG)
+            node.get_message_by_msgid(MSGID)
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_local_down(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.GET, LOCAL_MBOX, None)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_since_known_thread(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=PARTIAL)
+            node.get_thread_updates_since(MSGID, SINCE)
+        assert source_of(node) is Source.LOCAL
+
+    def test_since_unknown_thread(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            node.get_thread_updates_since(MSGID, SINCE)
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_search_hit(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            node.get_mbox_by_query('test')
+        assert source_of(node) is Source.LOCAL
+
+    def test_search_miss(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, status=404, headers=PARTIAL)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            node.get_mbox_by_query('test')
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_upstream_first_search(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, partial_search='upstream')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            node.get_mbox_by_query('test')
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_degraded_search(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, partial_search='upstream')
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            node.get_mbox_by_query('test')
+        assert source_of(node) is Source.DEGRADED
+
+    def test_degraded_search_learned_from_same_answer(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # The search's own answer is the first to say the node is partial.
+        node = self.node(tmp_path, learned=False, partial_search='upstream')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            node.get_mbox_by_query('test')
+        assert source_of(node) is Source.DEGRADED
+
+    def test_none_after_error(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            add_down(rsps, responses.GET, UP_MBOX, None)
+            node.get_mbox_by_msgid(MSGID)
+            assert source_of(node) is Source.UPSTREAM
+            with pytest.raises(NotOnMirrorError):
+                node.get_mbox_by_msgid(MSGID, nocache=True)
+        assert source_of(node) is None
+
+    def test_none_after_refused_call(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        assert source_of(node) is Source.LOCAL
+        node.shutdown()
+        with pytest.raises(OperationCancelledError):
+            node.get_mbox_by_msgid(MSGID)
+        assert source_of(node) is None
+
+    def test_each_call_starts_over(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=PARTIAL)
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_RAW, body=LOCAL_MSG)
+            node.get_mbox_by_msgid(MSGID)
+            node.get_message_by_msgid(MSGID)
+            assert source_of(node) is Source.UPSTREAM
+            # From this node's cache, with no request at all.
+            node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', LOCAL_MBOX)) == 1
+        assert source_of(node) is Source.LOCAL
+
+    def test_upstream_cache_is_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # The upstream node caches its answer; this node asks locally
+        # again, and then gets the upstream node's cached copy.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+            node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', LOCAL_MBOX)) == 2
+            assert urls(rsps).count(('GET', UP_MBOX)) == 1
+        assert source_of(node) is Source.UPSTREAM
+
+    @pytest.mark.parametrize('upstream_first', [True, False])
+    def test_batch_reports_the_worst(
+        self, tmp_path: Path, sample_mbox: bytes, upstream_first: bool
+    ) -> None:
+        other = 'second@example.com'
+        other_mbox = f'{LOCAL}/second%40example.com/t.mbox.gz'
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            rsps.add(responses.GET, other_mbox, body=gz(sample_mbox), headers=PARTIAL)
+            msgids = [MSGID, other] if upstream_first else [other, MSGID]
+            with patch('liblore.node.time.sleep'):
+                node.batch_get_thread_by_msgid(msgids)
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_batch_keeps_degraded(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        # An upstream answer after a degraded one doesn't hide it.
+        node = self.node(tmp_path, partial_search='upstream', upstream_holdoff=0)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            rsps.add(responses.POST, f'{UPSTREAM}/?x=m&q=other', body=gz(sample_mbox))
+            with patch('liblore.node.time.sleep'):
+                node.batch_get_thread_by_query(['test', 'other'])
+        assert source_of(node) is Source.DEGRADED
+
+    def test_per_thread(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        seen: dict[str, Source | None] = {}
+        local_done = threading.Event()
+        upstream_done = threading.Event()
+
+        def local() -> None:
+            node.get_mbox_by_msgid('second@example.com')
+            local_done.set()
+            # Read after the other thread's upstream call has finished.
+            upstream_done.wait(5)
+            seen['local'] = node.last_source
+
+        def upstream() -> None:
+            local_done.wait(5)
+            node.get_mbox_by_msgid(MSGID)
+            upstream_done.set()
+            seen['upstream'] = node.last_source
+
+        with responses.RequestsMock() as rsps:
+            rsps.add(
+                responses.GET,
+                f'{LOCAL}/second%40example.com/t.mbox.gz',
+                body=gz(sample_mbox),
+                headers=PARTIAL,
+            )
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            threads = [threading.Thread(target=f) for f in (local, upstream)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        assert seen == {'local': Source.LOCAL, 'upstream': Source.UPSTREAM}
+        # The node was learned partial on this thread, before either call.
+        assert source_of(node) is Source.LOCAL
+
+    # --- upstream_url ------------------------------------------------
+
+    def test_upstream_url_full_node(self, tmp_path: Path) -> None:
+        assert self.node(tmp_path, learned=False).upstream_url is None
+
+    def test_upstream_url_learned(self, tmp_path: Path) -> None:
+        assert self.node(tmp_path).upstream_url == UPSTREAM
+
+    def test_upstream_url_saved(self, tmp_path: Path) -> None:
+        self.node(tmp_path)
+        assert self.node(tmp_path, learned=False).upstream_url == UPSTREAM
+
+    def test_upstream_url_not_followed(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path, follow_upstream=False)
+        assert node.upstream_url is None

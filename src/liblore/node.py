@@ -30,6 +30,7 @@ from liblore import (
     NotOnMirrorError,
     OperationCancelledError,
     RemoteError,
+    Source,
 )
 from liblore.utils import (
     get_strict_thread,
@@ -223,6 +224,10 @@ def _warn_outage_once(kind: str, url: str, msg: str, *args: object) -> None:
         _warned_outage.add((kind, url))
     if first:
         logger.warning(msg, *args)
+
+
+# How bad each source is: an operation reports the worst one it saw.
+_SOURCE_RANK = {Source.LOCAL: 0, Source.UPSTREAM: 1, Source.DEGRADED: 2}
 
 
 def _unreachable(ex: RemoteError) -> bool:
@@ -841,19 +846,35 @@ class LoreNode:
         run, while operations started afterwards proceed normally.
         Re-entrant per thread: nested scopes join the outermost
         operation.
+
+        The outermost operation also collects where its answers came
+        from, and publishes the result as :attr:`last_source` when it
+        succeeds.
         """
         depth = getattr(self._op_local, 'depth', 0)
         if depth == 0:
+            self._op_local.last_source = None
             if self._shutdown_event.is_set():
                 raise OperationCancelledError('Node is shut down')
             self._op_local.generation = self._cancel_generation
+            self._op_local.source = Source.LOCAL
         self._op_local.depth = depth + 1
+        succeeded = False
         try:
             yield
+            succeeded = True
         finally:
             self._op_local.depth = depth
             if depth == 0:
                 self._op_local.generation = None
+                if succeeded:
+                    self._op_local.last_source = self._op_local.source
+
+    def _record_source(self, source: Source) -> None:
+        """Note that the current operation got an answer from *source*."""
+        current: Source = getattr(self._op_local, 'source', Source.LOCAL)
+        if _SOURCE_RANK[source] > _SOURCE_RANK[current]:
+            self._op_local.source = source
 
     def _cancelled(self) -> bool:
         """Whether the current thread's operation has been cancelled."""
@@ -947,6 +968,33 @@ class LoreNode:
     def hostname(self) -> str:
         """The hostname extracted from the URL, for logging and display."""
         return urllib.parse.urlparse(self._url).hostname or self._url
+
+    @property
+    def last_source(self) -> Source | None:
+        """Where the answer to this thread's last call came from.
+
+        Set when a call on this node returns, for the calling thread
+        only, so each thread sees its own calls.  ``None`` before the
+        first call, and after a call that raised: the exception says
+        what happened.  A call that got several answers, such as a
+        batch, reports the worst: :attr:`~liblore.Source.DEGRADED`,
+        then :attr:`~liblore.Source.UPSTREAM`, then
+        :attr:`~liblore.Source.LOCAL`.
+
+        On a node that is not a partial mirror, every answer is
+        :attr:`~liblore.Source.LOCAL`.
+        """
+        source: Source | None = getattr(self._op_local, 'last_source', None)
+        return source
+
+    @property
+    def upstream_url(self) -> str | None:
+        """The upstream archive this partial mirror named, or ``None``.
+
+        ``None`` for a node that is not a partial mirror, or with
+        ``follow_upstream=False``.
+        """
+        return self._get_upstream_url()
 
     @property
     def _netloc(self) -> str:
@@ -1250,6 +1298,12 @@ class LoreNode:
             return None
         upstream = self._fallback_node()
         if upstream is not None:
+            logger.debug(
+                '%s unreachable (status %s), asking %s',
+                self._url,
+                ex.status_code,
+                upstream.url,
+            )
             _warn_outage_once(
                 'local',
                 self._url,
@@ -1310,6 +1364,7 @@ class LoreNode:
                 self._end_holdoff(upstream)
             raise
         self._end_holdoff(upstream)
+        self._record_source(Source.UPSTREAM)
         return result
 
     def _held_off_for(self, upstream: LoreNode) -> float | None:
@@ -1367,15 +1422,17 @@ class LoreNode:
         asks the upstream node the same thing.
 
         A miss goes to the upstream.  When the upstream is unreachable
-        too, the answer the mirror did give is returned if there is
-        one, and :class:`~liblore.NotOnMirrorError` is raised if not.
+        too, the answer the mirror did give is returned as
+        :attr:`~liblore.Source.DEGRADED` if there is one, and
+        :class:`~liblore.NotOnMirrorError` is raised if not.
 
         When this node is unreachable and an upstream is known, the
         upstream answers.  With no upstream, *on_outage* answers for
         the node when given, and the error is raised when not.
 
         With *upstream_first*, the upstream is asked before this node,
-        and this node only when the upstream is unreachable.
+        and this node only when the upstream is unreachable: its answer
+        is then degraded.
         """
         if upstream_first:
             upstream = self._fallback_node()
@@ -1428,6 +1485,7 @@ class LoreNode:
                 missing = miss.missing or f'{what} is not'
                 raise self._not_on_mirror(upstream, missing, ex) from ex
             self._warn_degraded(upstream, ex)
+            self._record_source(Source.DEGRADED)
             return cast('_T', miss.answer)
 
     def _degraded(
@@ -1454,6 +1512,7 @@ class LoreNode:
                 upstream, missing, upstream_error
             ) from upstream_error
         self._warn_degraded(upstream, upstream_error)
+        self._record_source(Source.DEGRADED)
         return answer
 
     def _known_locally(self, msgid: str) -> bool:
@@ -2197,6 +2256,10 @@ class LoreNode:
         100 ms cooldown between requests (no sleep before the first).
 
         Returns a list of results in the same order as the input.
+        :attr:`last_source` then reports the worst source of them all;
+        to know where each thread came from, call
+        :meth:`get_thread_by_msgid` in a loop and read
+        :attr:`last_source` after each call.
         """
         results: list[list[EmailMessage]] = []
         for i, msgid in enumerate(msgids):
@@ -2223,6 +2286,10 @@ class LoreNode:
         include the full thread for every matching message.
 
         Returns a list of results in the same order as the input.
+        :attr:`last_source` then reports the worst source of them all;
+        to know where each result came from, call
+        :meth:`get_thread_by_query` in a loop and read
+        :attr:`last_source` after each call.
         """
         results: list[list[EmailMessage]] = []
         for i, query in enumerate(queries):
