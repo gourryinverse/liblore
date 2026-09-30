@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
 import threading
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -16,7 +18,7 @@ import pytest
 import requests
 import responses
 
-from liblore import LibloreError
+from liblore import LibloreError, OperationCancelledError, RemoteError
 from liblore.node import (
     LoreNode,
     _LoreNodeInitKwargs,
@@ -421,6 +423,24 @@ class TestGitConfig:
             LoreNode.from_git_config(LOCAL)
         assert 'allowupstream' in sub.call_args.kwargs['multivals']
 
+    @pytest.mark.parametrize(
+        ('value', 'mode'),
+        [('local', 'local'), (' LOCAL ', 'local'), ('upstream', 'upstream')],
+    )
+    def test_partialsearch(self, value: str, mode: str) -> None:
+        assert self.from_config({'partialsearch': value})._partial_search == mode
+
+    def test_partialsearch_default(self) -> None:
+        assert self.from_config({})._partial_search == 'upstream'
+
+    def test_invalid_partialsearch_keeps_default(self) -> None:
+        node = self.from_config({'partialsearch': 'sideways'})
+        assert node._partial_search == 'upstream'
+
+    def test_invalid_partial_search_argument(self) -> None:
+        with pytest.raises(LibloreError, match='partial_search'):
+            LoreNode(LOCAL, partial_search='sideways')
+
     def test_explicit_kwargs_win(self) -> None:
         cfg: dict[str, str | list[str]] = {
             'followupstream': 'false',
@@ -690,3 +710,449 @@ class TestUpstreamNode:
                 with pytest.raises(LibloreError, match='bad config'):
                     node._get_upstream_node()
             assert from_git_config.call_count == 1
+        # A miss then fails the same way, and the user sees why.
+        with responses.RequestsMock() as rsps:
+            rsps.add(
+                responses.GET,
+                f'{LOCAL}/x%40example.com/t.mbox.gz',
+                status=404,
+                headers=PARTIAL,
+            )
+            with pytest.raises(LibloreError, match='bad config'):
+                node.get_mbox_by_msgid('x@example.com')
+
+
+# =====================================================================
+# L3 + L9: a local miss goes upstream
+# =====================================================================
+
+MSGID = 'first@example.com'
+Q = 'first%40example.com'
+LOCAL_MBOX = f'{LOCAL}/{Q}/t.mbox.gz'
+UP_MBOX = f'{UPSTREAM}/{Q}/t.mbox.gz'
+LOCAL_RAW = f'{LOCAL}/{Q}/raw'
+UP_RAW = f'{UPSTREAM}/{Q}/raw'
+LOCAL_QUERY = f'{LOCAL}/?x=m&q=test'
+UP_QUERY = f'{UPSTREAM}/?x=m&q=test'
+SINCE = datetime(2024, 1, 15, 12, 0, tzinfo=timezone.utc)
+LOCAL_SINCE = f'{LOCAL}/{Q}/?x=m&q=rt%3A1705320000..'
+UP_SINCE = f'{UPSTREAM}/{Q}/?x=m&q=rt%3A1705320000..'
+# The HEAD redirect lookup of a full node: bare origin, no base path.
+REDIRECT_HEAD = f'http://127.0.0.1:11043/{Q}/'
+
+
+LOCAL_MSG = (
+    b'From x Mon Jan  1 00:00:00 2024\n'
+    b'From: Carol <carol@example.com>\n'
+    b'Subject: Re: First message\n'
+    b'Message-Id: <local@example.com>\n'
+    b'In-Reply-To: <first@example.com>\n'
+    b'\n'
+    b'Hello.\n'
+)
+
+
+def gz(data: bytes) -> bytes:
+    return gzip.compress(data)
+
+
+def urls(rsps: responses.RequestsMock) -> list[tuple[str, str | None]]:
+    """Every request sent, as ``(method, url)``, in order."""
+    return [(c.request.method or '', c.request.url) for c in rsps.calls]
+
+
+class TestMissRules:
+    @pytest.fixture(autouse=True)
+    def _git_config(self) -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+        with (
+            patch('liblore.node._get_subsection_config', return_value={}),
+            patch('liblore.node._get_config_from_git', return_value={}),
+        ):
+            yield
+
+    def node(
+        self,
+        tmp_path: Path,
+        *,
+        learned: bool = True,
+        follow_upstream: bool = True,
+        partial_search: str = 'upstream',
+    ) -> LoreNode:
+        """Return a node, by default one that knows it is partial."""
+        node = LoreNode(
+            LOCAL,
+            cache_dir=str(tmp_path),
+            follow_upstream=follow_upstream,
+            partial_search=partial_search,
+        )
+        if learned:
+            fetch(node, headers=PARTIAL)
+        return node
+
+    # --- get_mbox_by_msgid / get_thread_by_msgid ---------------------
+
+    def test_mbox_hit_is_local(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=PARTIAL)
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            assert urls(rsps) == [('GET', LOCAL_MBOX)]
+
+    def test_mbox_miss_goes_upstream(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            # No HEAD redirect lookup anywhere (L9).
+            assert urls(rsps) == [('GET', LOCAL_MBOX), ('GET', UP_MBOX)]
+
+    def test_mbox_miss_learned_from_same_answer(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            assert urls(rsps) == [('GET', LOCAL_MBOX), ('GET', UP_MBOX)]
+
+    def test_mbox_upstream_answer_cached_upstream_only(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+            # Local is asked again (the mirror may have it by now), and
+            # the upstream node answers from its own cache.
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            assert urls(rsps) == [
+                ('GET', LOCAL_MBOX),
+                ('GET', UP_MBOX),
+                ('GET', LOCAL_MBOX),
+            ]
+
+    def test_mbox_nocache_reaches_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+            node.get_mbox_by_msgid(MSGID, nocache=True)
+            assert urls(rsps).count(('GET', UP_MBOX)) == 2
+
+    def test_mbox_upstream_404_is_final(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, status=404)
+            # The upstream is a full node: it does its own redirect
+            # lookup, as it would for any other caller.
+            rsps.add(responses.HEAD, f'https://lore.kernel.org/{Q}/', status=404)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+            assert exc.value.status_code == 404
+            assert len(rsps.calls) == 3
+
+    def test_full_node_keeps_redirect_lookup(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404)
+            rsps.add(responses.HEAD, REDIRECT_HEAD, status=404)
+            with pytest.raises(RemoteError):
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps) == [('GET', LOCAL_MBOX), ('HEAD', REDIRECT_HEAD)]
+
+    def test_not_following_keeps_redirect_lookup(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path, learned=False, follow_upstream=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.HEAD, REDIRECT_HEAD, status=404)
+            with pytest.raises(RemoteError):
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps) == [('GET', LOCAL_MBOX), ('HEAD', REDIRECT_HEAD)]
+
+    def test_thread_miss_goes_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            msgs = node.get_thread_by_msgid(MSGID)
+            assert [m['Message-Id'] for m in msgs] == [
+                '<first@example.com>',
+                '<second@example.com>',
+            ]
+
+    def test_batch_per_item(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        other = f'{LOCAL}/second%40example.com/t.mbox.gz'
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            rsps.add(responses.GET, other, body=gz(sample_mbox), headers=PARTIAL)
+            with patch('liblore.node.time.sleep'):
+                results = node.batch_get_thread_by_msgid(
+                    [MSGID, 'second@example.com'], strict=False
+                )
+            assert len(results) == 2
+            assert urls(rsps) == [('GET', LOCAL_MBOX), ('GET', UP_MBOX), ('GET', other)]
+
+    def test_no_fallback_after_cancel(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+
+        def cancel_then_404(
+            _req: object,
+        ) -> tuple[int, dict[str, str], bytes]:
+            node.cancel_active()
+            return 404, PARTIAL, b''
+
+        with responses.RequestsMock() as rsps:
+            rsps.add_callback(responses.GET, LOCAL_MBOX, callback=cancel_then_404)
+            with pytest.raises(OperationCancelledError):
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps) == [('GET', LOCAL_MBOX)]
+
+    def test_upstream_uses_its_fallbacks(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        tor = 'https://tor.lore.kernel.org/all/first%40example.com/t.mbox.gz'
+        cfg: dict[str, str | list[str]] = {'fallback': ['https://tor.lore.kernel.org']}
+        with (
+            patch('liblore.node._get_config_from_git', return_value=cfg),
+            responses.RequestsMock() as rsps,
+        ):
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, tor, status=503)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            assert node.get_mbox_by_msgid(MSGID) == sample_mbox
+            assert urls(rsps) == [('GET', LOCAL_MBOX), ('GET', tor), ('GET', UP_MBOX)]
+
+    def test_one_hop_only(self, tmp_path: Path) -> None:
+        # The upstream says it is partial too, and names a trusted
+        # upstream of its own: that one is not asked.
+        node = self.node(tmp_path)
+        chained = {**PARTIAL, 'X-Archive-Upstream': 'https://lore.kernel.org/lkml'}
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_MBOX, status=404, headers=chained)
+            rsps.add(responses.HEAD, f'https://lore.kernel.org/{Q}/', status=404)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_msgid(MSGID)
+            assert exc.value.status_code == 404
+            assert len(rsps.calls) == 3
+
+    # --- get_message_by_msgid ----------------------------------------
+
+    def test_raw_hit_is_local(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, body=b'local', headers=PARTIAL)
+            assert node.get_message_by_msgid(MSGID) == b'local'
+            assert len(rsps.calls) == 1
+
+    def test_raw_miss_goes_upstream(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_RAW, body=b'upstream')
+            assert node.get_message_by_msgid(MSGID) == b'upstream'
+            assert urls(rsps) == [('GET', LOCAL_RAW), ('GET', UP_RAW)]
+
+    def test_raw_upstream_404_is_final(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.GET, UP_RAW, status=404)
+            with pytest.raises(RemoteError) as exc:
+                node.get_message_by_msgid(MSGID)
+            assert exc.value.status_code == 404
+
+    def test_raw_other_4xx_not_a_miss(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, status=403, headers=PARTIAL)
+            with pytest.raises(RemoteError) as exc:
+                node.get_message_by_msgid(MSGID)
+            assert exc.value.status_code == 403
+            assert len(rsps.calls) == 1
+
+    # --- get_mbox_by_query -------------------------------------------
+
+    def test_search_goes_upstream_first(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', UP_QUERY)]
+
+    def test_search_upstream_404_is_final(self, tmp_path: Path) -> None:
+        # lore.kernel.org answers "no results" with a 404, not an empty 200.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, UP_QUERY, status=404)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_query('test')
+            assert exc.value.status_code == 404
+            assert urls(rsps) == [('POST', UP_QUERY)]
+
+    def test_search_learned_from_same_answer(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b'partial'), headers=PARTIAL)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY), ('POST', UP_QUERY)]
+        # The mirror's partial answer was not cached.
+        key = node._cache_key('mbox_by_query', 'test', 'False')
+        assert node._cache_read(key) is None
+
+    def test_search_local_mode_hit(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, partial_search='local')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+
+    @pytest.mark.parametrize(('status', 'body'), [(404, b''), (200, gz(b''))])
+    def test_search_local_mode_miss(
+        self, tmp_path: Path, sample_mbox: bytes, status: int, body: bytes
+    ) -> None:
+        node = self.node(tmp_path, partial_search='local')
+        with responses.RequestsMock() as rsps:
+            rsps.add(
+                responses.POST, LOCAL_QUERY, status=status, body=body, headers=PARTIAL
+            )
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY), ('POST', UP_QUERY)]
+
+    def test_thread_by_query_upstream(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            msgs = node.get_thread_by_query('test')
+            assert len(msgs) == 2
+
+    # --- _fetch_thread_since: the known-thread check -----------------
+
+    def test_known_thread_searched_locally(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=PARTIAL)
+            msgs = node.get_thread_updates_since(MSGID, SINCE)
+            assert len(msgs) == 2
+            # The check comes before the search.
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', LOCAL_SINCE)]
+
+    def test_known_thread_via_redirect(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(
+                responses.HEAD,
+                LOCAL_RAW,
+                status=302,
+                headers={**PARTIAL, 'Location': f'{LOCAL}/elsewhere/raw'},
+            )
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=PARTIAL)
+            assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
+            # The redirect was not followed.
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', LOCAL_SINCE)]
+
+    @pytest.mark.parametrize(('status', 'body'), [(404, b''), (200, gz(b''))])
+    def test_known_thread_nothing_new_is_final(
+        self, tmp_path: Path, status: int, body: bytes
+    ) -> None:
+        # public-inbox answers 404 "No results found" for a known thread
+        # with no hits.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(
+                responses.POST, LOCAL_SINCE, status=status, body=body, headers=PARTIAL
+            )
+            assert node.get_thread_updates_since(MSGID, SINCE) == []
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', LOCAL_SINCE)]
+
+    def test_unknown_thread_goes_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # For an unknown message-id public-inbox drops the thread limit
+        # and searches the whole archive, so the mirror is never searched.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            msgs = node.get_thread_updates_since(MSGID, SINCE)
+            assert len(msgs) == 2
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', UP_SINCE)]
+
+    def test_unknown_thread_nothing_new_upstream(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.POST, UP_SINCE, status=404)
+            assert node.get_thread_updates_since(MSGID, SINCE) == []
+
+    def test_thread_by_msgid_since(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        up = f'{UPSTREAM}/{Q}/?x=m&q=dt%3A20240101..'
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, status=404, headers=PARTIAL)
+            rsps.add(responses.POST, up, body=gz(sample_mbox))
+            msgs = node.get_thread_by_msgid(MSGID, since='20240101')
+            assert len(msgs) == 2
+
+    @pytest.mark.parametrize('head_status', [200, 404])
+    def test_check_after_learning_from_search(
+        self, tmp_path: Path, sample_mbox: bytes, head_status: int
+    ) -> None:
+        # A node that learns it is partial from the search answer itself
+        # can't trust that answer without the check.
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(LOCAL_MSG), headers=PARTIAL)
+            rsps.add(responses.HEAD, LOCAL_RAW, status=head_status, headers=PARTIAL)
+            if head_status == 404:
+                rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            msgs = node._fetch_thread_since(MSGID, 'rt:1705320000..')
+            sent = urls(rsps)
+        if head_status == 404:
+            # Unknown here: the mirror's answer was a whole-archive search.
+            assert len(msgs) == 2
+            assert sent[-1] == ('POST', UP_SINCE)
+        else:
+            assert [m['Message-Id'] for m in msgs] == ['<local@example.com>']
+            assert sent == [('POST', LOCAL_SINCE), ('HEAD', LOCAL_RAW)]
+
+    def test_full_node_sends_no_check(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox))
+            assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
+            assert urls(rsps) == [('POST', LOCAL_SINCE)]
+
+    # --- local only --------------------------------------------------
+
+    def test_validate_is_local_only(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, f'{LOCAL}/_/text/help/', status=404)
+            with pytest.raises(RemoteError):
+                node.validate()
+            assert len(rsps.calls) == 1

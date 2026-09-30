@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
     _P = ParamSpec('_P')
     _R = TypeVar('_R')
+    _T = TypeVar('_T')
 
 
 class _LoreNodeInitKwargs(TypedDict, total=False):
@@ -54,6 +55,7 @@ class _LoreNodeInitKwargs(TypedDict, total=False):
     cache_dir: str | None
     cache_ttl: int
     follow_upstream: bool
+    partial_search: str
     allowed_upstreams: list[str] | None
 
 
@@ -197,11 +199,24 @@ def _git_bool(value: str) -> bool | None:
 # Upstreams followed without being listed in allowupstream (section 2.4 of
 # the partial mirrors spec).
 _BUILTIN_UPSTREAMS = frozenset({'https://lore.kernel.org'})
+# Where a partial node sends whole-archive searches first.
+_PARTIAL_SEARCH_MODES = ('upstream', 'local')
 
 # Hosts already warned about, so each untrusted upstream is logged once
 # per process, not once per response.
 _warned_untrusted: set[str] = set()
 _warned_lock = threading.Lock()
+
+
+class _Miss(Exception):
+    """This partial mirror doesn't have what was asked (see :meth:`LoreNode._answer`).
+
+    *upstream* is the node to ask instead.
+    """
+
+    def __init__(self, upstream: LoreNode) -> None:
+        super().__init__(f'not on the mirror, asking {upstream.url}')
+        self.upstream = upstream
 
 
 def _normalize_url(url: str) -> str:
@@ -343,6 +358,7 @@ class LoreNode:
         cache_dir: str | None = None,
         cache_ttl: int = 600,
         follow_upstream: bool = True,
+        partial_search: str = 'upstream',
         allowed_upstreams: list[str] | None = None,
     ) -> None:
         self._url = url.rstrip('/')
@@ -388,6 +404,12 @@ class LoreNode:
         # Partial mirrors: the upstream archive learned from the
         # X-Archive-* response headers (see _learn_upstream).
         self._follow_upstream = follow_upstream
+        if partial_search not in _PARTIAL_SEARCH_MODES:
+            raise LibloreError(
+                f'Invalid partial_search (expected upstream or local): '
+                f'{partial_search!r}'
+            )
+        self._partial_search = partial_search
         trusted = set(_BUILTIN_UPSTREAMS)
         for au in allowed_upstreams or []:
             try:
@@ -499,6 +521,15 @@ class LoreNode:
             is a partial mirror (``X-Archive-Coverage: partial``) is
             remembered together with the upstream archive it names in
             ``X-Archive-Upstream``.  ``false`` ignores those headers.
+            Something the partial mirror doesn't have is then fetched
+            from the upstream archive.
+
+        ``partialsearch``
+            ``upstream`` (the default) or ``local``.  Where a partial
+            mirror sends a whole-archive search first.  A partial
+            mirror can't know what it is missing, so by default the
+            upstream archive answers.  ``local`` asks the mirror first,
+            and the upstream archive only when the mirror finds nothing.
 
         ``allowupstream``
             Multi-valued.  Each value is an origin (``scheme://host``)
@@ -606,6 +637,15 @@ class LoreNode:
                     logger.debug('Ignoring invalid followupstream value: %r', val)
                 else:
                     kwargs['follow_upstream'] = flag
+
+        if 'partial_search' not in kwargs:
+            val = gitcfg.get('partialsearch')
+            if isinstance(val, str):
+                mode = val.strip().lower()
+                if mode in _PARTIAL_SEARCH_MODES:
+                    kwargs['partial_search'] = mode
+                else:
+                    logger.debug('Ignoring invalid partialsearch value: %r', val)
 
         if 'allowed_upstreams' not in kwargs:
             allowed = gitcfg.get('allowupstream')
@@ -1101,6 +1141,67 @@ class LoreNode:
             logger.debug('Built upstream node for %s', url)
             return node
 
+    def _fallback_node(self) -> LoreNode | None:
+        """Return the upstream node to retry a local miss on, or ``None``.
+
+        Raises :class:`OperationCancelledError` when this node's
+        operation was cancelled: never fall back after a cancel.
+        """
+        upstream = self._get_upstream_node()
+        if upstream is not None and self._cancelled():
+            raise OperationCancelledError('Request cancelled')
+        return upstream
+
+    def _answer(
+        self,
+        what: str,
+        local: Callable[[], _T],
+        remote: Callable[[LoreNode], _T],
+        *,
+        upstream_first: bool = False,
+    ) -> _T:
+        """Answer from this node, or from the upstream archive.
+
+        This is the one place the retry rules of the partial mirrors
+        spec live.  *what* names the thing asked for, for log messages.
+
+        *local* asks this node.  It returns its answer, or raises
+        :class:`_Miss` when this partial mirror doesn't have *what*.
+        *remote* asks the upstream node the same thing.  A miss goes to
+        the upstream.
+
+        With *upstream_first*, the upstream is asked before this node.
+        """
+        if upstream_first:
+            upstream = self._fallback_node()
+            if upstream is not None:
+                logger.debug('Asking %s first for %s', upstream.url, what)
+                return remote(upstream)
+        try:
+            return local()
+        except _Miss as miss:
+            return self._after_miss(miss, what, remote)
+
+    def _after_miss(
+        self, miss: _Miss, what: str, remote: Callable[[LoreNode], _T]
+    ) -> _T:
+        """Ask the upstream for *what*, which this partial mirror doesn't have."""
+        upstream = miss.upstream
+        logger.debug('%s not on %s, asking %s', what, self._url, upstream.url)
+        return remote(upstream)
+
+    def _known_locally(self, msgid: str) -> bool:
+        """Ask this node whether it has the message *msgid*.
+
+        A thread-scoped search for a message-id the server doesn't
+        know searches the whole archive instead (public-inbox drops
+        the thread limit), so a partial node checks before searching.
+        """
+        raw_url = f'{self._url}/{urllib.parse.quote_plus(msgid)}/raw'
+        resp = self._request('HEAD', raw_url, allow_redirects=False)
+        resp.close()
+        return resp.status_code != 404
+
     def _probe_one(self, origin: str) -> tuple[str, float]:
         """HEAD manifest.js.gz on *origin*, return (origin, elapsed).
 
@@ -1374,6 +1475,9 @@ class LoreNode:
         handles public-inbox servers where the configured URL does not
         include the archive path (e.g. ``https://lore.kernel.org``
         instead of ``https://lore.kernel.org/all``).
+
+        On a partial mirror, a thread the mirror doesn't have comes from
+        the upstream archive.
         """
         key = self._cache_key('mbox_by_msgid', msgid)
         if not nocache:
@@ -1381,10 +1485,32 @@ class LoreNode:
             if cached is not None:
                 return cached
 
+        # The upstream node caches its own answers, under its own keys.
+        # A named function, not a lambda: mypy can't infer a lambda
+        # that calls this decorated method from inside its own body.
+        def remote(upstream: LoreNode) -> bytes:
+            return upstream.get_mbox_by_msgid(msgid, nocache=nocache)
+
+        return self._answer(
+            msgid, lambda: self._local_mbox_by_msgid(msgid, key), remote
+        )
+
+    def _local_mbox_by_msgid(self, msgid: str, key: str) -> bytes:
+        """Fetch the thread mbox from this node, for :meth:`get_mbox_by_msgid`.
+
+        Raises :class:`_Miss` when this partial mirror doesn't have the
+        thread.
+        """
         qmsgid = urllib.parse.quote_plus(msgid)
         mbox_url = f'{self._url}/{qmsgid}/t.mbox.gz'
         resp = self._request('GET', mbox_url)
         if resp.status_code == 404:
+            upstream = self._fallback_node()
+            if upstream is not None:
+                # Skip the redirect lookup below: it drops the base
+                # path, and the upstream archive has the whole thing.
+                resp.close()
+                raise _Miss(upstream)
             # The message may live under a different list path.  Try a
             # HEAD against the bare origin and follow redirects to
             # discover the canonical location.
@@ -1439,13 +1565,51 @@ class LoreNode:
         When *full_threads* is ``True``, the server expands results to
         include the full thread for every matching message (public-inbox
         ``t=1`` parameter).
-        """
-        key = self._cache_key('mbox_by_query', query, str(full_threads))
-        if not nocache:
-            cached = self._cache_read(key)
-            if cached is not None:
-                return cached
 
+        On a partial mirror the search goes to the upstream archive,
+        because the mirror can't know which hits it is missing.  With
+        ``partial_search='local'`` the mirror is asked first, and the
+        upstream archive only when the mirror finds nothing.
+        """
+
+        # A named function, not a lambda: mypy can't infer a lambda
+        # that calls this decorated method from inside its own body.
+        def remote(upstream: LoreNode) -> bytes:
+            return upstream.get_mbox_by_query(
+                query, full_threads=full_threads, nocache=nocache
+            )
+
+        key = self._cache_key('mbox_by_query', query, str(full_threads))
+        upstream_first = self._partial_search == 'upstream'
+
+        def local() -> bytes:
+            if not nocache:
+                cached = self._cache_read(key)
+                if cached is not None:
+                    return cached
+            try:
+                t_mbox = self._local_search(query, full_threads)
+            except RemoteError as ex:
+                # This answer may be the first to say the node is partial.
+                upstream = self._fallback_node()
+                if upstream is None or ex.status_code != 404:
+                    raise
+                raise _Miss(upstream) from ex
+            upstream = self._fallback_node()
+            if upstream is not None and (upstream_first or not t_mbox):
+                raise _Miss(upstream)
+            self._cache_write(key, t_mbox)
+            return t_mbox
+
+        return self._answer(
+            f'Search {query!r}', local, remote, upstream_first=upstream_first
+        )
+
+    def _local_search(self, query: str, full_threads: bool) -> bytes:
+        """POST a whole-archive search to this node and return the mbox.
+
+        Raises :class:`RemoteError` for any answer but a 200.
+        """
         t_param = '&t=1' if full_threads else ''
         query_url = (
             self._url + '/?x=m' + t_param + '&q=' + urllib.parse.quote_plus(query)
@@ -1458,8 +1622,6 @@ class LoreNode:
             )
         t_mbox = gzip.decompress(resp.content)
         resp.close()
-
-        self._cache_write(key, t_mbox)
         return t_mbox
 
     # -----------------------------------------------------------------
@@ -1533,6 +1695,37 @@ class LoreNode:
         the range are returned.
 
         Returns an empty list when the server finds no matches.
+
+        On a partial mirror, :meth:`_known_locally` runs first.  For a
+        thread the mirror doesn't have, the search would cover the
+        whole mirror instead of one thread, so it goes to the upstream
+        archive and the mirror is not searched.  For a thread the
+        mirror has, its answer is final, even when it is "nothing new".
+        """
+
+        def remote(upstream: LoreNode) -> list[EmailMessage]:
+            return self._search_thread_upstream(upstream, msgid, query_fragment)
+
+        def local() -> list[EmailMessage]:
+            upstream = self._fallback_node()
+            if upstream is not None and not self._known_locally(msgid):
+                raise _Miss(upstream)
+            msgs = self._search_thread(msgid, query_fragment)
+            if upstream is None:
+                # This answer may be the first to say the node is
+                # partial, and then it can't be trusted without the
+                # check.
+                upstream = self._fallback_node()
+                if upstream is not None and not self._known_locally(msgid):
+                    raise _Miss(upstream)
+            return msgs
+
+        return self._answer(f'Thread {msgid}', local, remote)
+
+    def _search_thread(self, msgid: str, query_fragment: str) -> list[EmailMessage]:
+        """Run the thread-scoped search on this node.
+
+        Returns an empty list when the server finds no matches.
         """
         qmsgid = urllib.parse.quote_plus(msgid)
         query = urllib.parse.quote_plus(query_fragment)
@@ -1545,6 +1738,20 @@ class LoreNode:
         if not t_mbox:
             return []
         return split_and_dedupe(t_mbox)
+
+    def _search_thread_upstream(
+        self,
+        upstream: LoreNode,
+        msgid: str,
+        query_fragment: str,
+    ) -> list[EmailMessage]:
+        """Run :meth:`_search_thread` on *upstream*, as one operation.
+
+        The upstream is a full archive, so it needs no known-thread
+        check.
+        """
+        with upstream._operation():
+            return upstream._search_thread(msgid, query_fragment)
 
     @_operation_scope
     def get_thread_updates_since(
@@ -1612,30 +1819,63 @@ class LoreNode:
 
     @_operation_scope
     def get_message_by_msgid(self, msgid: str, *, nocache: bool = False) -> bytes:
-        """Fetch a single raw email message by message ID."""
+        """Fetch a single raw email message by message ID.
+
+        On a partial mirror, a message the mirror doesn't have comes
+        from the upstream archive.
+        """
         key = self._cache_key('message_by_msgid', msgid)
         if not nocache:
             cached = self._cache_read(key)
             if cached is not None:
                 return cached
 
+        # A named function, not a lambda: mypy can't infer a lambda
+        # that calls this decorated method from inside its own body.
+        def remote(upstream: LoreNode) -> bytes:
+            return upstream.get_message_by_msgid(msgid, nocache=nocache)
+
+        return self._answer(
+            msgid, lambda: self._local_message_by_msgid(msgid, key), remote
+        )
+
+    def _local_message_by_msgid(self, msgid: str, key: str) -> bytes:
+        """Fetch the raw message from this node, for :meth:`get_message_by_msgid`.
+
+        Raises :class:`_Miss` when this partial mirror doesn't have the
+        message.
+        """
         raw_url = f'{self._url}/{urllib.parse.quote_plus(msgid)}/raw'
+
+        def failed(ex: Exception) -> RemoteError:
+            status = None
+            if isinstance(ex, requests.HTTPError) and ex.response is not None:
+                status = ex.response.status_code
+            return RemoteError(
+                f'Failed to fetch message from {raw_url}: {ex}',
+                status_code=status,
+            )
+
         try:
             response = self._request('GET', raw_url)
-            response.raise_for_status()
-            data: bytes = response.content
         except LibloreError:
             # RemoteError, and OperationCancelledError: a cancel is not
             # a server failure.
             raise
         except Exception as ex:
-            status = None
-            if isinstance(ex, requests.HTTPError) and ex.response is not None:
-                status = ex.response.status_code
-            raise RemoteError(
-                f'Failed to fetch message from {raw_url}: {ex}',
-                status_code=status,
-            ) from ex
+            raise failed(ex) from ex
+
+        if response.status_code == 404:
+            upstream = self._fallback_node()
+            if upstream is not None:
+                response.close()
+                raise _Miss(upstream)
+
+        try:
+            response.raise_for_status()
+            data: bytes = response.content
+        except Exception as ex:
+            raise failed(ex) from ex
 
         self._cache_write(key, data)
         return data
