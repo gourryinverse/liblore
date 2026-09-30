@@ -253,10 +253,10 @@ class _HeldOffError(RemoteError):
 class _Miss(Exception):
     """This partial mirror doesn't have what was asked (see :meth:`LoreNode._answer`).
 
-    *upstream* is the node to ask instead.  *answer* is what the mirror
-    did answer, when there was an answer worth keeping should the
-    upstream turn out to be unreachable: a whole-archive search finds
-    some of the hits, or none.  *missing* starts the
+    *upstream* is the node to ask instead.  *answer* and *as_of* are
+    what the mirror did answer, when there was an answer worth keeping
+    should the upstream turn out to be unreachable: a whole-archive
+    search finds some of the hits, or none.  *missing* starts the
     :class:`~liblore.NotOnMirrorError` message, when the default
     ``'<what> is not'`` doesn't read well.
     """
@@ -265,12 +265,14 @@ class _Miss(Exception):
         self,
         upstream: LoreNode,
         answer: object = None,
+        as_of: float | None = None,
         *,
         missing: str | None = None,
     ) -> None:
         super().__init__(f'not on the mirror, asking {upstream.url}')
         self.upstream = upstream
         self.answer = answer
+        self.as_of = as_of
         self.missing = missing
 
 
@@ -325,6 +327,72 @@ def _header(resp: requests.Response, name: str) -> str | None:
     """Return response header *name*, or ``None`` when it is not a string."""
     value: object = resp.headers.get(name)
     return value if isinstance(value, str) else None
+
+
+def _partial(resp: requests.Response) -> bool:
+    """Whether *resp* comes from a partial mirror."""
+    coverage = _header(resp, 'X-Archive-Coverage')
+    return coverage is not None and _parse_coverage(coverage)[0] == 'partial'
+
+
+# An ``updated`` time further ahead of our clock than this is junk, not
+# clock skew.
+_UPDATED_MAX_SKEW = 300
+
+
+def _updated(resp: requests.Response) -> float | None:
+    """Return the ``updated`` time of a partial mirror's answer, or ``None``.
+
+    It is when the mirror last caught up with its upstream, as a Unix
+    time.  ``None`` when *resp* is not from a partial mirror, or the
+    mirror doesn't say; a value that is not a non-negative integer, or
+    is in the future, is ignored.
+    """
+    coverage = _header(resp, 'X-Archive-Coverage')
+    if coverage is None:
+        return None
+    token, params = _parse_coverage(coverage)
+    value = params.get('updated')
+    if token != 'partial' or value is None:
+        return None
+    # isdigit() alone takes other scripts' digits, which int() reads too.
+    if not (value.isascii() and value.isdigit()):
+        logger.debug('Ignoring updated=%r from %s', value, resp.url)
+        return None
+    updated = int(value)
+    if updated > time.time() + _UPDATED_MAX_SKEW:
+        logger.debug('Ignoring updated=%r from %s: in the future', value, resp.url)
+        return None
+    return float(updated)
+
+
+def _answer_as_of(resp: requests.Response, sent: float) -> float:
+    """How far the answer in *resp*, asked for at *sent*, reaches.
+
+    A partial mirror's answer reaches its ``updated`` time; any other
+    answer reaches the time the request was sent.  Never later than
+    *sent*, so a server clock ahead of ours can't make it skip mail.
+    """
+    updated = _updated(resp)
+    if updated is None:
+        return sent
+    return min(updated, sent)
+
+
+def _date_string_epoch(since: str) -> float | None:
+    """The Unix time of a ``YYYYMMDDHHMMSS`` *since* string, if it is one.
+
+    public-inbox accepts looser forms too (``dt:2024..``); those give
+    ``None``, and the answer is then not said to reach back to them.
+    """
+    try:
+        return (
+            datetime.strptime(since, '%Y%m%d%H%M%S')
+            .replace(tzinfo=timezone.utc)
+            .timestamp()
+        )
+    except ValueError:
+        return None
 
 
 def _operation_scope(func: Callable[_P, _R]) -> Callable[_P, _R]:
@@ -848,16 +916,18 @@ class LoreNode:
         operation.
 
         The outermost operation also collects where its answers came
-        from, and publishes the result as :attr:`last_source` when it
-        succeeds.
+        from and how far they reach, and publishes the result as
+        :attr:`last_source` and :attr:`last_as_of` when it succeeds.
         """
         depth = getattr(self._op_local, 'depth', 0)
         if depth == 0:
             self._op_local.last_source = None
+            self._op_local.last_as_of = None
             if self._shutdown_event.is_set():
                 raise OperationCancelledError('Node is shut down')
             self._op_local.generation = self._cancel_generation
             self._op_local.source = Source.LOCAL
+            self._op_local.as_of = None
         self._op_local.depth = depth + 1
         succeeded = False
         try:
@@ -869,12 +939,29 @@ class LoreNode:
                 self._op_local.generation = None
                 if succeeded:
                     self._op_local.last_source = self._op_local.source
+                    self._op_local.last_as_of = self._op_local.as_of
 
     def _record_source(self, source: Source) -> None:
         """Note that the current operation got an answer from *source*."""
         current: Source = getattr(self._op_local, 'source', Source.LOCAL)
         if _SOURCE_RANK[source] > _SOURCE_RANK[current]:
             self._op_local.source = source
+
+    def _record_as_of(self, as_of: float | None) -> None:
+        """Note that the current operation got an answer reaching *as_of*.
+
+        The operation reaches only as far as its oldest answer.
+        """
+        if as_of is None:
+            return
+        current: float | None = getattr(self._op_local, 'as_of', None)
+        if current is None or as_of < current:
+            self._op_local.as_of = as_of
+
+    def _last_as_of(self) -> float | None:
+        """:attr:`last_as_of` as a Unix time."""
+        as_of: float | None = getattr(self._op_local, 'last_as_of', None)
+        return as_of
 
     def _cancelled(self) -> bool:
         """Whether the current thread's operation has been cancelled."""
@@ -986,6 +1073,31 @@ class LoreNode:
         """
         source: Source | None = getattr(self._op_local, 'last_source', None)
         return source
+
+    @property
+    def last_as_of(self) -> datetime | None:
+        """How far the answer to this thread's last call reaches (UTC).
+
+        Mail that the archive received before this time is in the
+        answer.  For a partial mirror's answer, this is when the mirror
+        last caught up with its upstream (the ``updated`` time it
+        sends).  For any other answer, it is when the request was sent.
+        A call that got several answers, such as a batch, reports the
+        oldest.  An answer from the cache reaches when it was cached.
+
+        Set by the same rules as :attr:`last_source`: per thread,
+        ``None`` before the first call and after a call that raised.
+        Always set by :meth:`get_thread_updates_since`, and by the
+        other methods that fetch messages; ``None`` after
+        :meth:`request`.
+
+        A poller should pass it as the next *since* of
+        :meth:`get_thread_updates_since`, instead of its own clock.
+        """
+        as_of = self._last_as_of()
+        if as_of is None:
+            return None
+        return datetime.fromtimestamp(as_of, timezone.utc)
 
     @property
     def upstream_url(self) -> str | None:
@@ -1180,8 +1292,7 @@ class LoreNode:
         if not self._follow_upstream:
             return
         upstream = None
-        coverage = _header(resp, 'X-Archive-Coverage')
-        if coverage is not None and _parse_coverage(coverage)[0] == 'partial':
+        if _partial(resp):
             value = _header(resp, 'X-Archive-Upstream')
             if value is not None:
                 upstream = self._usable_upstream(value)
@@ -1365,6 +1476,8 @@ class LoreNode:
             raise
         self._end_holdoff(upstream)
         self._record_source(Source.UPSTREAM)
+        # remote() ran an operation of its own on the upstream node.
+        self._record_as_of(upstream._last_as_of())
         return result
 
     def _held_off_for(self, upstream: LoreNode) -> float | None:
@@ -1404,7 +1517,7 @@ class LoreNode:
     def _answer(
         self,
         what: str,
-        local: Callable[[], _T],
+        local: Callable[[], tuple[_T, float | None]],
         remote: Callable[[LoreNode], _T],
         *,
         upstream_first: bool = False,
@@ -1416,10 +1529,11 @@ class LoreNode:
         mirrors spec live.  *what* names the thing asked for, for log
         and error messages.
 
-        *local* asks this node.  It returns its answer; or it raises
-        :class:`_Miss` when this partial mirror doesn't have *what*; or
-        :class:`~liblore.RemoteError` when the node failed.  *remote*
-        asks the upstream node the same thing.
+        *local* asks this node.  It returns its answer and how far the
+        answer reaches (see :attr:`last_as_of`), which is recorded
+        here; or it raises :class:`_Miss` when this partial mirror
+        doesn't have *what*; or :class:`~liblore.RemoteError` when the
+        node failed.  *remote* asks the upstream node the same thing.
 
         A miss goes to the upstream.  When the upstream is unreachable
         too, the answer the mirror did give is returned as
@@ -1445,7 +1559,7 @@ class LoreNode:
                         raise
                     return self._degraded(upstream, what, local, ex)
         try:
-            return local()
+            answer, as_of = local()
         except _Miss as miss:
             return self._after_miss(miss, what, remote)
         except RemoteError as ex:
@@ -1463,6 +1577,8 @@ class LoreNode:
                     f'{what}: the local mirror ({self._netloc}) is unreachable '
                     f'({ex}), and {held}'
                 ) from held
+        self._record_as_of(as_of)
+        return answer
 
     def _after_miss(
         self, miss: _Miss, what: str, remote: Callable[[LoreNode], _T]
@@ -1486,13 +1602,14 @@ class LoreNode:
                 raise self._not_on_mirror(upstream, missing, ex) from ex
             self._warn_degraded(upstream, ex)
             self._record_source(Source.DEGRADED)
+            self._record_as_of(miss.as_of)
             return cast('_T', miss.answer)
 
     def _degraded(
         self,
         upstream: LoreNode,
         what: str,
-        local: Callable[[], _T],
+        local: Callable[[], tuple[_T, float | None]],
         upstream_error: RemoteError,
     ) -> _T:
         """Ask this partial mirror for *what* because *upstream* is unreachable.
@@ -1503,9 +1620,9 @@ class LoreNode:
         """
         missing = None
         try:
-            answer = local()
+            answer, as_of = local()
         except _Miss as miss:
-            answer, missing = cast('_T', miss.answer), miss.missing
+            answer, as_of, missing = cast('_T', miss.answer), miss.as_of, miss.missing
         if not answer:
             missing = missing or f'{what} is not'
             raise self._not_on_mirror(
@@ -1513,6 +1630,7 @@ class LoreNode:
             ) from upstream_error
         self._warn_degraded(upstream, upstream_error)
         self._record_source(Source.DEGRADED)
+        self._record_as_of(as_of)
         return answer
 
     def _known_locally(self, msgid: str) -> bool:
@@ -1522,6 +1640,10 @@ class LoreNode:
         know searches the whole archive instead (public-inbox drops
         the thread limit), so a partial node checks before searching.
         Raises :class:`RemoteError` when this node is unreachable.
+
+        A partial mirror that doesn't say when it last caught up with
+        its upstream (no ``updated`` time) can't be trusted to have the
+        thread's new mail, so this returns ``False`` for it too.
         """
         raw_url = f'{self._url}/{urllib.parse.quote_plus(msgid)}/raw'
         resp = self._request('HEAD', raw_url, allow_redirects=False)
@@ -1531,7 +1653,12 @@ class LoreNode:
                 f'Server returned an error: {resp.status_code}',
                 status_code=resp.status_code,
             )
-        return resp.status_code != 404
+        if resp.status_code == 404:
+            return False
+        if _partial(resp) and _updated(resp) is None:
+            logger.debug('%s sends no updated time, not searching it', self._url)
+            return False
+        return True
 
     def _probe_one(self, origin: str) -> tuple[str, float]:
         """HEAD manifest.js.gz on *origin*, return (origin, elapsed).
@@ -1738,7 +1865,9 @@ class LoreNode:
             return None
         logger.debug('Cache hit (%ds old): %s', age, key[:12])
         with open(path, 'rb') as f:
-            return f.read()
+            data = f.read()
+        self._record_as_of(st.st_mtime)
+        return data
 
     def _cache_write(self, key: str, data: bytes) -> None:
         """Write data to cache. Errors are logged but never raised."""
@@ -1834,7 +1963,7 @@ class LoreNode:
             msgid, lambda: self._local_mbox_by_msgid(msgid, key), remote
         )
 
-    def _local_mbox_by_msgid(self, msgid: str, key: str) -> bytes:
+    def _local_mbox_by_msgid(self, msgid: str, key: str) -> tuple[bytes, float]:
         """Fetch the thread mbox from this node, for :meth:`get_mbox_by_msgid`.
 
         Raises :class:`_Miss` when this partial mirror doesn't have the
@@ -1842,6 +1971,7 @@ class LoreNode:
         """
         qmsgid = urllib.parse.quote_plus(msgid)
         mbox_url = f'{self._url}/{qmsgid}/t.mbox.gz'
+        sent = time.time()
         resp = self._request('GET', mbox_url)
         if resp.status_code == 404:
             upstream = self._fallback_node()
@@ -1863,7 +1993,7 @@ class LoreNode:
         resp.close()
 
         self._cache_write(key, t_mbox)
-        return t_mbox
+        return t_mbox, _answer_as_of(resp, sent)
 
     def _resolve_msgid_via_head(self, qmsgid: str) -> requests.Response:
         """HEAD the bare origin to discover the list path, then GET the mbox.
@@ -1922,13 +2052,13 @@ class LoreNode:
         key = self._cache_key('mbox_by_query', query, str(full_threads))
         upstream_first = self._partial_search == 'upstream'
 
-        def local() -> bytes:
+        def local() -> tuple[bytes, float | None]:
             if not nocache:
                 cached = self._cache_read(key)
                 if cached is not None:
-                    return cached
+                    return cached, None
             try:
-                t_mbox = self._local_search(query, full_threads)
+                t_mbox, as_of = self._local_search(query, full_threads)
             except RemoteError as ex:
                 # This answer may be the first to say the node is partial.
                 upstream = self._fallback_node()
@@ -1939,23 +2069,28 @@ class LoreNode:
             if upstream is not None and (upstream_first or not t_mbox):
                 # The mirror's answer, which may be incomplete: never
                 # cached.
-                raise _Miss(upstream, t_mbox, missing=f'No results for {query!r}')
+                raise _Miss(
+                    upstream, t_mbox, as_of, missing=f'No results for {query!r}'
+                )
             self._cache_write(key, t_mbox)
-            return t_mbox
+            return t_mbox, as_of
 
         return self._answer(
             f'Search {query!r}', local, remote, upstream_first=upstream_first
         )
 
-    def _local_search(self, query: str, full_threads: bool) -> bytes:
-        """POST a whole-archive search to this node and return the mbox.
+    def _local_search(self, query: str, full_threads: bool) -> tuple[bytes, float]:
+        """POST a whole-archive search to this node.
 
-        Raises :class:`RemoteError` for any answer but a 200.
+        Returns the mbox, and how far it reaches (see :attr:`last_as_of`)
+        for the caller to record if it uses the answer.  Raises
+        :class:`RemoteError` for any answer but a 200.
         """
         t_param = '&t=1' if full_threads else ''
         query_url = (
             self._url + '/?x=m' + t_param + '&q=' + urllib.parse.quote_plus(query)
         )
+        sent = time.time()
         resp = self._request('POST', query_url, data='x=m')
         if resp.status_code != 200:
             raise RemoteError(
@@ -1964,7 +2099,7 @@ class LoreNode:
             )
         t_mbox = gzip.decompress(resp.content)
         resp.close()
-        return t_mbox
+        return t_mbox, _answer_as_of(resp, sent)
 
     # -----------------------------------------------------------------
     # Primary API — parsed messages
@@ -1999,7 +2134,9 @@ class LoreNode:
         Raises :class:`LookupError` when no messages match.
         """
         if since:
-            msgs = self._fetch_thread_since(msgid, f'dt:{since}..')
+            msgs = self._fetch_thread_since(
+                msgid, f'dt:{since}..', since=_date_string_epoch(since)
+            )
             if not msgs:
                 raise LookupError(f'No messages found for msgid={msgid} since={since}')
         else:
@@ -2025,6 +2162,7 @@ class LoreNode:
         self,
         msgid: str,
         query_fragment: str,
+        since: float | None = None,
     ) -> list[EmailMessage]:
         """Fetch thread messages matching a date-range query fragment.
 
@@ -2048,16 +2186,20 @@ class LoreNode:
         answers.  When the mirror doesn't have the thread and the
         upstream is unreachable, :class:`~liblore.NotOnMirrorError` is
         raised: "nothing new" would be a guess.
+
+        *since* is the Unix time *query_fragment* starts at, if it is a
+        received time.  When the node is unreachable and the answer is
+        an empty "nothing new", the answer reaches no further than it.
         """
 
         def remote(upstream: LoreNode) -> list[EmailMessage]:
             return self._search_thread_upstream(upstream, msgid, query_fragment)
 
-        def local() -> list[EmailMessage]:
+        def local() -> tuple[list[EmailMessage], float | None]:
             upstream = self._fallback_node()
             if upstream is not None and not self._known_locally(msgid):
                 raise _Miss(upstream)
-            msgs = self._search_thread(msgid, query_fragment)
+            msgs, as_of = self._search_thread(msgid, query_fragment)
             if upstream is None:
                 # This answer may be the first to say the node is
                 # partial, and then it can't be trusted without the
@@ -2065,27 +2207,34 @@ class LoreNode:
                 upstream = self._fallback_node()
                 if upstream is not None and not self._known_locally(msgid):
                     raise _Miss(upstream)
-            return msgs
+            return msgs, as_of
 
         def on_outage(ex: RemoteError) -> list[EmailMessage]:
             if ex.status_code is None:
                 raise ex
             # Every origin answered 5xx: a full node has always reported
-            # that as "nothing new".
+            # that as "nothing new", and it has told us nothing past
+            # *since*.
+            self._record_as_of(since)
             return []
 
         return self._answer(f'Thread {msgid}', local, remote, on_outage=on_outage)
 
-    def _search_thread(self, msgid: str, query_fragment: str) -> list[EmailMessage]:
+    def _search_thread(
+        self, msgid: str, query_fragment: str
+    ) -> tuple[list[EmailMessage], float]:
         """Run the thread-scoped search on this node.
 
-        Returns an empty list when the server finds no matches.  Raises
-        :class:`RemoteError` when the server is unreachable, 5xx
+        Returns the messages, an empty list when the server finds no
+        matches, and how far the answer reaches (see
+        :attr:`last_as_of`) for the caller to record if it uses it.
+        Raises :class:`RemoteError` when the server is unreachable, 5xx
         included.
         """
         qmsgid = urllib.parse.quote_plus(msgid)
         query = urllib.parse.quote_plus(query_fragment)
         search_url = f'{self._url}/{qmsgid}/?x=m&q={query}'
+        sent = time.time()
         resp = self._request('POST', search_url, raise_on_error=False, data='')
         if resp.status_code >= 500:
             resp.close()
@@ -2093,13 +2242,14 @@ class LoreNode:
                 f'Server returned an error: {resp.status_code}',
                 status_code=resp.status_code,
             )
+        as_of = _answer_as_of(resp, sent)
         if resp.status_code != 200:
-            return []
+            return [], as_of
         t_mbox = gzip.decompress(resp.content)
         resp.close()
         if not t_mbox:
-            return []
-        return split_and_dedupe(t_mbox)
+            return [], as_of
+        return split_and_dedupe(t_mbox), as_of
 
     def _search_thread_upstream(
         self,
@@ -2114,7 +2264,9 @@ class LoreNode:
         "nothing new".
         """
         with upstream._operation():
-            return upstream._search_thread(msgid, query_fragment)
+            msgs, as_of = upstream._search_thread(msgid, query_fragment)
+            upstream._record_as_of(as_of)
+            return msgs
 
     @_operation_scope
     def get_thread_updates_since(
@@ -2144,9 +2296,28 @@ class LoreNode:
         only messages belonging to the thread rooted at *msgid*.
 
         When *sort* is ``True``, messages are sorted by Received date.
+
+        To poll, pass :attr:`last_as_of` as the next *since*, not your
+        own clock.  A mirror is always a little behind the archive it
+        mirrors, and its "nothing new" is only true up to its last
+        catch-up.  With your own clock, mail can fall into the gap:
+
+        1. At 12:05 you poll with ``since=12:00``.  The mirror last
+           caught up at 11:58, so it has nothing new.
+        2. A reply reached the archive at 12:01.  The mirror gets it
+           at 12:08.
+        3. At 12:10 you poll with ``since=12:05``.  The reply was
+           received at 12:01, before 12:05: it is never reported.
+
+        With ``since=node.last_as_of`` the second poll starts at 11:58
+        and finds the reply.  Polls then overlap a little, so skip
+        messages you have already seen, by Message-ID::
+
+            updates = node.get_thread_updates_since(msgid, since)
+            since = node.last_as_of
         """
         epoch = int(since.astimezone(timezone.utc).timestamp())
-        msgs = self._fetch_thread_since(msgid, f'rt:{epoch}..')
+        msgs = self._fetch_thread_since(msgid, f'rt:{epoch}..', since=epoch)
 
         if strict and msgs:
             strict_msgs = get_strict_thread(msgs, msgid)
@@ -2203,7 +2374,7 @@ class LoreNode:
             msgid, lambda: self._local_message_by_msgid(msgid, key), remote
         )
 
-    def _local_message_by_msgid(self, msgid: str, key: str) -> bytes:
+    def _local_message_by_msgid(self, msgid: str, key: str) -> tuple[bytes, float]:
         """Fetch the raw message from this node, for :meth:`get_message_by_msgid`.
 
         Raises :class:`_Miss` when this partial mirror doesn't have the
@@ -2220,6 +2391,7 @@ class LoreNode:
                 status_code=status,
             )
 
+        sent = time.time()
         try:
             response = self._request('GET', raw_url)
         except LibloreError:
@@ -2242,7 +2414,7 @@ class LoreNode:
             raise failed(ex) from ex
 
         self._cache_write(key, data)
-        return data
+        return data, _answer_as_of(response, sent)
 
     # -----------------------------------------------------------------
     # Batch API

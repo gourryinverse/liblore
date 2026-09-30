@@ -28,13 +28,14 @@ from liblore import (
 )
 from liblore.node import (
     LoreNode,
+    _date_string_epoch,
     _LoreNodeInitKwargs,
     _normalize_url,
     _parse_coverage,
 )
 
 if TYPE_CHECKING:
-    from typing_extensions import Unpack
+    from typing_extensions import Self, Unpack
 
 LOCAL = 'http://127.0.0.1:11043/lore/all'
 RAW = f'{LOCAL}/x%40example.com/raw'
@@ -43,6 +44,10 @@ PARTIAL = {
     'X-Archive-Coverage': 'partial',
     'X-Archive-Upstream': 'https://lore.kernel.org/all/',
 }
+# A partial mirror that says when it last caught up: its known threads
+# can be searched locally.
+UPDATED = 1790000000
+FRESH = {**PARTIAL, 'X-Archive-Coverage': f'partial; updated={UPDATED}'}
 # A partial mirror naming an upstream that is not trusted by default.
 OTHER = {**PARTIAL, 'X-Archive-Upstream': 'https://mirror.example.com/all'}
 
@@ -1100,7 +1105,7 @@ class TestMissRules(PartialNode):
     ) -> None:
         node = self.node(tmp_path)
         with responses.RequestsMock() as rsps:
-            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=FRESH)
             rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=PARTIAL)
             msgs = node.get_thread_updates_since(MSGID, SINCE)
             assert len(msgs) == 2
@@ -1116,7 +1121,7 @@ class TestMissRules(PartialNode):
                 responses.HEAD,
                 LOCAL_RAW,
                 status=302,
-                headers={**PARTIAL, 'Location': f'{LOCAL}/elsewhere/raw'},
+                headers={**FRESH, 'Location': f'{LOCAL}/elsewhere/raw'},
             )
             rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=PARTIAL)
             assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
@@ -1131,7 +1136,7 @@ class TestMissRules(PartialNode):
         # with no hits.
         node = self.node(tmp_path)
         with responses.RequestsMock() as rsps:
-            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=FRESH)
             rsps.add(
                 responses.POST, LOCAL_SINCE, status=status, body=body, headers=PARTIAL
             )
@@ -1176,7 +1181,7 @@ class TestMissRules(PartialNode):
         node = self.node(tmp_path, learned=False)
         with responses.RequestsMock() as rsps:
             rsps.add(responses.POST, LOCAL_SINCE, body=gz(LOCAL_MSG), headers=PARTIAL)
-            rsps.add(responses.HEAD, LOCAL_RAW, status=head_status, headers=PARTIAL)
+            rsps.add(responses.HEAD, LOCAL_RAW, status=head_status, headers=FRESH)
             if head_status == 404:
                 rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
             msgs = node._fetch_thread_since(MSGID, 'rt:1705320000..')
@@ -1491,7 +1496,7 @@ class TestUnreachable(PartialNode):
         # The mirror knows the thread, then fails on the search itself.
         node = self.node(tmp_path)
         with responses.RequestsMock() as rsps:
-            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=FRESH)
             add_down(rsps, responses.POST, LOCAL_SINCE, status)
             rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
             assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
@@ -1680,7 +1685,8 @@ class TestHoldOff(PartialNode):
             assert upstream == [UP_MBOX]
         assert not isinstance(exc.value, NotOnMirrorError)
         assert exc.value.status_code is None
-        # The error names both failures.
+        # Both failures are named: the hold-off alone would read as if
+        # the mirror had answered.
         assert LOCAL_HOST in str(exc.value)
         assert 'unreachable' in str(exc.value)
 
@@ -1924,7 +1930,7 @@ class TestProvenance(PartialNode):
     def test_since_known_thread(self, tmp_path: Path, sample_mbox: bytes) -> None:
         node = self.node(tmp_path)
         with responses.RequestsMock() as rsps:
-            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=FRESH)
             rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=PARTIAL)
             node.get_thread_updates_since(MSGID, SINCE)
         assert source_of(node) is Source.LOCAL
@@ -2250,3 +2256,429 @@ class TestCacheRules(PartialNode):
         node._upstream_node = None
         node.clear_cache()
         assert not (tmp_path / 'old' / 'x.lore.cache').exists()
+
+
+# =====================================================================
+# L10: freshness
+# =====================================================================
+
+
+def as_of_of(node: LoreNode) -> float | None:
+    """Read ``last_as_of`` fresh, as a Unix time."""
+    as_of = node.last_as_of
+    return None if as_of is None else as_of.timestamp()
+
+
+def coverage(value: str) -> dict[str, str]:
+    return {**PARTIAL, 'X-Archive-Coverage': value}
+
+
+class Timer:
+    """The wall clock around a call, to check an answer's time."""
+
+    def __enter__(self) -> Self:
+        self.start = time.time()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.end = time.time()
+
+    def spans(self, when: float | None) -> bool:
+        return when is not None and self.start <= when <= self.end
+
+
+class TestFreshness(PartialNode):
+    def test_none_before_first_call(self) -> None:
+        assert LoreNode(LOCAL).last_as_of is None
+
+    def test_utc_datetime(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=FRESH)
+            node.get_mbox_by_msgid(MSGID)
+        assert node.last_as_of == datetime.fromtimestamp(UPDATED, timezone.utc)
+
+    def test_full_node_is_request_time(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = LoreNode(UPSTREAM, cache_dir=str(tmp_path))
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        assert timer.spans(as_of_of(node))
+
+    def test_partial_without_updated_is_request_time(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=PARTIAL)
+            node.get_mbox_by_msgid(MSGID)
+        assert timer.spans(as_of_of(node))
+
+    def test_raw_local(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_RAW, body=LOCAL_MSG, headers=FRESH)
+            node.get_message_by_msgid(MSGID)
+        assert as_of_of(node) == UPDATED
+
+    def test_search_local(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=FRESH)
+            node.get_mbox_by_query('test')
+        assert as_of_of(node) == UPDATED
+
+    # --- an upstream answer: the mirror's miss doesn't count ---------
+
+    def test_mbox_upstream(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=FRESH)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+        assert timer.spans(as_of_of(node))
+
+    def test_raw_upstream(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=FRESH)
+            rsps.add(responses.GET, UP_RAW, body=LOCAL_MSG)
+            node.get_message_by_msgid(MSGID)
+        assert timer.spans(as_of_of(node))
+
+    def test_search_upstream(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b''), headers=FRESH)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            node.get_mbox_by_query('test')
+        assert timer.spans(as_of_of(node))
+
+    def test_search_upstream_first(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, partial_search='upstream')
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            node.get_mbox_by_query('test')
+        assert timer.spans(as_of_of(node))
+
+    def test_learned_then_upstream(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        # The mirror's own answer says it is partial, and is replaced
+        # by the upstream's.
+        node = self.node(tmp_path, learned=False, partial_search='upstream')
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b'partial'), headers=FRESH)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            node.get_mbox_by_query('test')
+        assert timer.spans(as_of_of(node))
+
+    # --- degraded answers ----------------------------------------------
+
+    def test_degraded(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, partial_search='upstream')
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=FRESH)
+            node.get_mbox_by_query('test')
+        assert source_of(node) is Source.DEGRADED
+        assert as_of_of(node) == UPDATED
+
+    def test_degraded_without_updated(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, partial_search='upstream')
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            node.get_mbox_by_query('test')
+        assert timer.spans(as_of_of(node))
+
+    def test_degraded_learned_from_same_answer(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path, learned=False, partial_search='upstream')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=FRESH)
+            add_down(rsps, responses.POST, UP_QUERY, None)
+            node.get_mbox_by_query('test')
+        assert source_of(node) is Source.DEGRADED
+        assert as_of_of(node) == UPDATED
+
+    # --- thread updates --------------------------------------------------
+
+    def test_since_known_thread(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=FRESH)
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=FRESH)
+            node.get_thread_updates_since(MSGID, SINCE)
+        assert as_of_of(node) == UPDATED
+
+    def test_since_nothing_new(self, tmp_path: Path) -> None:
+        # The answer that matters most: "nothing new, as of updated".
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=FRESH)
+            rsps.add(responses.POST, LOCAL_SINCE, status=404, headers=FRESH)
+            assert node.get_thread_updates_since(MSGID, SINCE) == []
+        assert as_of_of(node) == UPDATED
+
+    def test_since_unknown_thread(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.HEAD, LOCAL_RAW, status=404, headers=FRESH)
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            node.get_thread_updates_since(MSGID, SINCE)
+        assert timer.spans(as_of_of(node))
+
+    def test_since_full_node(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox))
+            node.get_thread_updates_since(MSGID, SINCE)
+        assert timer.spans(as_of_of(node))
+
+    def test_since_full_node_5xx(self, tmp_path: Path) -> None:
+        # "Nothing new" because every origin failed: it says nothing
+        # past since, so the next poll starts there again.
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_SINCE, status=503)
+            assert node.get_thread_updates_since(MSGID, SINCE) == []
+        assert node.last_as_of == SINCE
+
+    def test_thread_by_msgid_since_full_node_5xx(self, tmp_path: Path) -> None:
+        # The dt: path has a since too; parse it so the answer says how
+        # far back it reaches.
+        node = self.node(tmp_path, learned=False)
+        since = f'{LOCAL}/{Q}/?x=m&q=dt%3A20240115120000..'
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, since, status=503)
+            with pytest.raises(LookupError):
+                node.get_thread_by_msgid(MSGID, since='20240115120000')
+            # The operation raised, so nothing is published; a batch
+            # that goes on reads it from the operation's state.
+            with node._operation():
+                node._fetch_thread_since(
+                    MSGID, 'dt:20240115120000..', since=SINCE.timestamp()
+                )
+                assert node._op_local.as_of == SINCE.timestamp()
+
+    @pytest.mark.parametrize('bad', ['2024', '20240115', 'yesterday'])
+    def test_loose_since_reaches_nowhere(self, bad: str) -> None:
+        assert _date_string_epoch(bad) is None
+
+    def test_since_string_is_utc(self) -> None:
+        assert _date_string_epoch('20240115120000') == SINCE.timestamp()
+
+    def test_thread_by_msgid_since(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        since = f'{LOCAL}/{Q}/?x=m&q=dt%3A20240115120000..'
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=FRESH)
+            rsps.add(responses.POST, since, body=gz(sample_mbox), headers=FRESH)
+            node.get_thread_by_msgid(MSGID, since='20240115120000')
+        assert as_of_of(node) == UPDATED
+
+    # --- no updated time: the mirror's "nothing new" can't be trusted ---
+
+    def test_no_updated_goes_upstream(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
+            # The mirror is not searched.
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', UP_SINCE)]
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_junk_updated_goes_upstream(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(
+                responses.HEAD, LOCAL_RAW, headers=coverage('partial; updated=soon')
+            )
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            node.get_thread_updates_since(MSGID, SINCE)
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', UP_SINCE)]
+
+    def test_no_updated_upstream_down(self, tmp_path: Path) -> None:
+        # "Nothing new" from the mirror would be a guess.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=PARTIAL)
+            add_down(rsps, responses.POST, UP_SINCE, None)
+            with pytest.raises(NotOnMirrorError):
+                node.get_thread_updates_since(MSGID, SINCE)
+            assert ('POST', LOCAL_SINCE) not in urls(rsps)
+
+    def test_check_answered_by_full_node(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        # The mirror is no longer partial: its answer is final, as on
+        # any full node.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.HEAD, LOCAL_RAW)
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox))
+            assert len(node.get_thread_updates_since(MSGID, SINCE)) == 2
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', LOCAL_SINCE)]
+        assert node.upstream_url is None
+
+    # --- which updated values count --------------------------------------
+
+    @pytest.mark.parametrize(
+        'value',
+        [
+            'soon',
+            '-5',
+            '+5',
+            '1.5',
+            '',
+            # Not ASCII digits, though int() reads them.
+            '١٧٩',
+        ],
+    )
+    def test_junk_updated_ignored(
+        self, tmp_path: Path, sample_mbox: bytes, value: str
+    ) -> None:
+        node = self.node(tmp_path)
+        headers = coverage(f'partial; updated={value}')
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=headers)
+            node.get_mbox_by_msgid(MSGID)
+        assert timer.spans(as_of_of(node))
+
+    def test_far_future_ignored(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        future = int(time.time()) + 3600
+        headers = coverage(f'partial; updated={future}')
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=headers)
+            rsps.add(responses.POST, UP_SINCE, body=gz(sample_mbox))
+            node.get_thread_updates_since(MSGID, SINCE)
+            # Junk: the mirror can't be trusted with "nothing new".
+            assert urls(rsps) == [('HEAD', LOCAL_RAW), ('POST', UP_SINCE)]
+        assert timer.spans(as_of_of(node))
+
+    def test_near_future_is_skew(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        # A server clock a little ahead is accepted, but the answer
+        # never reaches past the time we asked.
+        node = self.node(tmp_path)
+        headers = coverage(f'partial; updated={int(time.time()) + 200}')
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.HEAD, LOCAL_RAW, headers=headers)
+            rsps.add(responses.POST, LOCAL_SINCE, body=gz(sample_mbox), headers=headers)
+            node.get_thread_updates_since(MSGID, SINCE)
+            assert ('POST', UP_SINCE) not in urls(rsps)
+        assert timer.spans(as_of_of(node))
+
+    def test_names_ignore_case(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        headers = coverage(f'Partial; Updated={UPDATED}; coverage=/x')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=headers)
+            node.get_mbox_by_msgid(MSGID)
+        assert as_of_of(node) == UPDATED
+
+    def test_updated_needs_partial(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = LoreNode(LOCAL, cache_dir=str(tmp_path))
+        headers = coverage(f'full; updated={UPDATED}')
+        with responses.RequestsMock() as rsps, Timer() as timer:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=headers)
+            node.get_mbox_by_msgid(MSGID)
+        assert timer.spans(as_of_of(node))
+
+    # --- operations ------------------------------------------------------
+
+    @pytest.mark.parametrize('older_first', [True, False])
+    def test_batch_reports_the_oldest(
+        self, tmp_path: Path, sample_mbox: bytes, older_first: bool
+    ) -> None:
+        other = 'second@example.com'
+        other_mbox = f'{LOCAL}/second%40example.com/t.mbox.gz'
+        newer = coverage(f'partial; updated={UPDATED + 100}')
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=FRESH)
+            rsps.add(responses.GET, other_mbox, body=gz(sample_mbox), headers=newer)
+            msgids = [MSGID, other] if older_first else [other, MSGID]
+            with patch('liblore.node.time.sleep'):
+                node.batch_get_thread_by_msgid(msgids)
+        assert as_of_of(node) == UPDATED
+
+    def test_each_call_starts_over(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        newer = coverage(f'partial; updated={UPDATED + 100}')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=FRESH)
+            rsps.add(responses.GET, LOCAL_RAW, body=LOCAL_MSG, headers=newer)
+            node.get_mbox_by_msgid(MSGID, nocache=True)
+            assert as_of_of(node) == UPDATED
+            node.get_message_by_msgid(MSGID, nocache=True)
+        assert as_of_of(node) == UPDATED + 100
+
+    def test_none_after_error(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=FRESH)
+            rsps.add(responses.GET, LOCAL_RAW, status=404, headers=FRESH)
+            add_down(rsps, responses.GET, UP_RAW, None)
+            node.get_mbox_by_msgid(MSGID)
+            assert as_of_of(node) == UPDATED
+            with pytest.raises(NotOnMirrorError):
+                node.get_message_by_msgid(MSGID)
+        assert as_of_of(node) is None
+
+    def test_none_after_request(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        fetch(node, headers=FRESH)
+        assert node.last_as_of is None
+
+    def test_cache_hit_is_mtime(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=FRESH)
+            node.get_mbox_by_msgid(MSGID)
+        path = tmp_path / f'{node._cache_key("mbox_by_msgid", MSGID)}.lore.cache'
+        os.utime(path, (UPDATED + 50, UPDATED + 50))
+        with patch('liblore.node.time.time', return_value=UPDATED + 60):
+            node.get_mbox_by_msgid(MSGID)
+        assert as_of_of(node) == UPDATED + 50
+
+    def test_upstream_cache_hit_is_mtime(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, status=404, headers=FRESH)
+            rsps.add(responses.GET, UP_MBOX, body=gz(sample_mbox))
+            node.get_mbox_by_msgid(MSGID)
+            up = node._get_upstream_node()
+            assert up is not None
+            key = up._cache_key('mbox_by_msgid', MSGID)
+            os.utime(tmp_path / f'{key}.lore.cache', (UPDATED + 50, UPDATED + 50))
+            with patch('liblore.node.time.time', return_value=UPDATED + 60):
+                node.get_mbox_by_msgid(MSGID)
+            assert urls(rsps).count(('GET', UP_MBOX)) == 1
+        assert as_of_of(node) == UPDATED + 50
+
+    def test_per_thread(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        seen: list[float | None] = []
+
+        def other() -> None:
+            node.get_message_by_msgid(MSGID)
+            seen.append(as_of_of(node))
+
+        newer = coverage(f'partial; updated={UPDATED + 100}')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.GET, LOCAL_MBOX, body=gz(sample_mbox), headers=FRESH)
+            rsps.add(responses.GET, LOCAL_RAW, body=LOCAL_MSG, headers=newer)
+            node.get_mbox_by_msgid(MSGID)
+            thread = threading.Thread(target=other)
+            thread.start()
+            thread.join()
+        assert seen == [UPDATED + 100]
+        assert as_of_of(node) == UPDATED
