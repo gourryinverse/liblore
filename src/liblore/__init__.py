@@ -2,6 +2,8 @@
 # Copyright (C) 2025-2026 The Linux Foundation
 """liblore — shared library for public-inbox / lore.kernel.org access."""
 
+from __future__ import annotations
+
 import email.charset
 import email.policy
 from email.message import EmailMessage
@@ -25,7 +27,17 @@ class LibloreError(Exception):
 
 
 class RemoteError(LibloreError):
-    """Raised when a remote HTTP request fails."""
+    """Raised when a remote HTTP request fails.
+
+    :attr:`status_code` is the HTTP status the server answered with, or
+    ``None`` when no answer arrived at all (connection error, timeout).
+    It lets callers tell "the server says it doesn't have this" (404)
+    apart from "the server could not be reached".
+    """
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class PublicInboxError(LibloreError):

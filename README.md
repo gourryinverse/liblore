@@ -918,8 +918,12 @@ from liblore import LibloreError, RemoteError, PublicInboxError
 
 try:
     msgs = node.get_thread_by_msgid('nonexistent@example.com')
-except RemoteError:
+except RemoteError as ex:
     # HTTP request failed (server error, network issue, etc.)
+    if ex.status_code == 404:
+        ...  # the server answered: it does not have this
+    elif ex.status_code is None:
+        ...  # no answer at all: connection error or timeout
     ...
 except PublicInboxError:
     # Something went wrong with the public-inbox operation

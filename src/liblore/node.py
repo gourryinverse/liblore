@@ -965,7 +965,10 @@ class LoreNode:
             # discover the canonical location.
             resp = self._resolve_msgid_via_head(qmsgid)
         if resp.status_code != 200:
-            raise RemoteError(f'Server returned an error: {resp.status_code}')
+            raise RemoteError(
+                f'Server returned an error: {resp.status_code}',
+                status_code=resp.status_code,
+            )
         t_mbox = gzip.decompress(resp.content)
         resp.close()
 
@@ -1023,7 +1026,10 @@ class LoreNode:
         )
         resp = self._request('POST', query_url, data='x=m')
         if resp.status_code != 200:
-            raise RemoteError(f'Server returned an error: {resp.status_code}')
+            raise RemoteError(
+                f'Server returned an error: {resp.status_code}',
+                status_code=resp.status_code,
+            )
         t_mbox = gzip.decompress(resp.content)
         resp.close()
 
@@ -1195,7 +1201,13 @@ class LoreNode:
         except RemoteError:
             raise
         except Exception as ex:
-            raise RemoteError(f'Failed to fetch message from {raw_url}: {ex}') from ex
+            status = None
+            if isinstance(ex, requests.HTTPError) and ex.response is not None:
+                status = ex.response.status_code
+            raise RemoteError(
+                f'Failed to fetch message from {raw_url}: {ex}',
+                status_code=status,
+            ) from ex
 
         self._cache_write(key, data)
         return data
@@ -1275,5 +1287,6 @@ class LoreNode:
         if resp.status_code != 200:
             raise RemoteError(
                 f'URL does not appear to be a public-inbox server '
-                f'(HEAD {help_url} returned {resp.status_code})'
+                f'(HEAD {help_url} returned {resp.status_code})',
+                status_code=resp.status_code,
             )

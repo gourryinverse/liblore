@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gzip
 import os
+import pickle
 import subprocess
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -23,6 +24,30 @@ def request_url(rsps: responses.RequestsMock, index: int) -> str:
     url = rsps.calls[index].request.url
     assert url is not None
     return url
+
+
+# =====================================================================
+# RemoteError
+# =====================================================================
+
+
+class TestRemoteError:
+    def test_status_code_defaults_to_none(self) -> None:
+        # Code written before status_code existed keeps working.
+        err = RemoteError('boom')
+        assert str(err) == 'boom'
+        assert err.status_code is None
+
+    def test_status_code(self) -> None:
+        err = RemoteError('not found', status_code=404)
+        assert str(err) == 'not found'
+        assert err.status_code == 404
+
+    def test_pickle_keeps_status_code(self) -> None:
+        # Errors cross process boundaries (concurrent.futures).
+        err = pickle.loads(pickle.dumps(RemoteError('gone', status_code=410)))
+        assert str(err) == 'gone'
+        assert err.status_code == 410
 
 
 # =====================================================================
@@ -155,8 +180,9 @@ class TestGetMboxByMsgid:
                 status=500,
             )
 
-            with pytest.raises(RemoteError, match='Server returned an error'):
+            with pytest.raises(RemoteError, match='Server returned an error') as ei:
                 node.get_mbox_by_msgid('test@x.com')
+            assert ei.value.status_code == 500
 
     def test_404_falls_back_to_head_redirect(self, sample_mbox: bytes) -> None:
         with responses.RequestsMock() as rsps:
@@ -210,8 +236,11 @@ class TestGetMboxByMsgid:
                 status=404,
             )
 
-            with pytest.raises(RemoteError, match='Server returned an error: 404'):
+            with pytest.raises(
+                RemoteError, match='Server returned an error: 404'
+            ) as ei:
                 node.get_mbox_by_msgid('nonexistent@example.com')
+            assert ei.value.status_code == 404
 
 
 class TestGetMboxByQuery:
@@ -265,8 +294,24 @@ class TestGetMboxByQuery:
                 status=500,
             )
 
-            with pytest.raises(RemoteError, match='Server returned an error'):
+            with pytest.raises(RemoteError, match='Server returned an error') as ei:
                 node.get_mbox_by_query('test')
+            assert ei.value.status_code == 500
+
+    def test_no_results_is_404(self) -> None:
+        with responses.RequestsMock() as rsps:
+            """lore.kernel.org answers a search with no hits with a 404."""
+            node = LoreNode('https://lore.kernel.org/all')
+            rsps.add(
+                responses.POST,
+                'https://lore.kernel.org/all/?x=m&q=nomatch',
+                body=b'No results found\n',
+                status=404,
+            )
+
+            with pytest.raises(RemoteError, match='Server returned an error') as ei:
+                node.get_mbox_by_query('nomatch')
+            assert ei.value.status_code == 404
 
     # =====================================================================
     # get_thread_by_msgid
@@ -489,8 +534,22 @@ class TestGetMessageByMsgid:
                 body=requests.ConnectionError('connection refused'),
             )
 
-            with pytest.raises(RemoteError):
+            with pytest.raises(RemoteError) as ei:
                 node.get_message_by_msgid('test@x.com')
+            assert ei.value.status_code is None
+
+    def test_not_found_has_status(self) -> None:
+        with responses.RequestsMock() as rsps:
+            node = LoreNode('https://lore.kernel.org/all')
+            rsps.add(
+                responses.GET,
+                'https://lore.kernel.org/all/test%40x.com/raw',
+                status=404,
+            )
+
+            with pytest.raises(RemoteError, match='Failed to fetch message') as ei:
+                node.get_message_by_msgid('test@x.com')
+            assert ei.value.status_code == 404
 
     # =====================================================================
     # batch_get_thread_by_msgid
@@ -653,8 +712,9 @@ class TestValidate:
                 status=404,
             )
 
-            with pytest.raises(RemoteError, match='does not appear'):
+            with pytest.raises(RemoteError, match='does not appear') as ei:
                 node.validate()
+            assert ei.value.status_code == 404
 
     def test_connection_error(self) -> None:
         with responses.RequestsMock() as rsps:
@@ -665,8 +725,9 @@ class TestValidate:
                 body=requests.ConnectionError('connection refused'),
             )
 
-            with pytest.raises(RemoteError, match='Failed to reach'):
+            with pytest.raises(RemoteError, match='Failed to reach') as ei:
                 node.validate()
+            assert ei.value.status_code is None
 
     # =====================================================================
     # URL fallback
@@ -809,8 +870,9 @@ class TestFallback:
                 body=requests.ConnectionError('refused'),
             )
 
-            with pytest.raises(RemoteError, match='All hosts failed'):
+            with pytest.raises(RemoteError, match='All hosts failed') as ei:
                 node.get_mbox_by_msgid('test@example.com')
+            assert ei.value.status_code is None
             assert len(rsps.calls) == 2
 
     def test_all_hosts_fail_5xx(self) -> None:
@@ -832,8 +894,9 @@ class TestFallback:
             )
 
             # get_mbox_by_msgid checks status_code and raises RemoteError
-            with pytest.raises(RemoteError, match='Server returned an error'):
+            with pytest.raises(RemoteError, match='Server returned an error') as ei:
                 node.get_mbox_by_msgid('test@example.com')
+            assert ei.value.status_code == 503
             assert len(rsps.calls) == 2
 
     def test_all_hosts_fail_no_raise(self) -> None:
@@ -1906,8 +1969,9 @@ class TestRequest:
                 body=requests.ConnectionError('refused'),
             )
 
-            with pytest.raises(RemoteError, match='All hosts failed'):
+            with pytest.raises(RemoteError, match='All hosts failed') as ei:
                 node.request('GET', 'https://lore.kernel.org/manifest.js.gz')
+            assert ei.value.status_code is None
 
     def test_kwargs_forwarded(self) -> None:
         """Extra kwargs (e.g. timeout) are passed through."""

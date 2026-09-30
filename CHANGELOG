@@ -26,6 +26,10 @@ v0.10.0 (unreleased)
   errors='replace' does not cover it, because the codec name is what
   fails to resolve. It now falls back to utf-8, as b4 does for bodies
   and as clean_header() already did for headers.
+- Add RemoteError.status_code, the HTTP status the server answered
+  with, or None when no answer arrived (connection error, timeout).
+  Callers can now tell "not found" (404) apart from "could not be
+  reached". Messages are unchanged, and RemoteError('text') still works.
 
 v0.9.0 (2026-08-12)
 -------------------
