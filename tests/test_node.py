@@ -1581,6 +1581,35 @@ class TestProbeOrigins:
             # Different origins → cache miss → fresh probe
             assert len(rsps.calls) == 4
 
+    @pytest.mark.parametrize(
+        'contents',
+        [
+            '5',
+            'null',
+            '"https://lore.kernel.org"',
+            '[["https://lore.kernel.org"]]',
+            '["https://lore.kernel.org", "https://fast.example.com", 5]',
+            '{"https://lore.kernel.org": 1, "https://fast.example.com": 2}',
+        ],
+    )
+    def test_probe_cache_corrupt_is_ignored(
+        self, tmp_path: object, contents: str
+    ) -> None:
+        """A cache file that is valid JSON but not a list of origins is a miss."""
+        node = LoreNode(
+            'https://lore.kernel.org/all',
+            fallback_urls=['https://fast.example.com'],
+            cache_dir=str(tmp_path),
+        )
+        assert set(node._all_origins) == {
+            'https://lore.kernel.org',
+            'https://fast.example.com',
+        }
+        path = os.path.join(str(tmp_path), f'{node._probe_cache_key()}.lore.cache')
+        with open(path, 'w') as f:
+            f.write(contents)
+        assert node._probe_cache_read() is None
+
     def test_probe_nocache_skips_cache(self, tmp_path: object) -> None:
         with responses.RequestsMock() as rsps:
             """nocache=True forces a live probe even when cache is fresh."""

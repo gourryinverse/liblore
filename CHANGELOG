@@ -42,6 +42,10 @@ v0.10.0 (unreleased)
 - Fix the autoprobe git config key ignoring git's other true values.
   yes, on and 1 now turn probing on, as they would in git. A value git
   would reject keeps the default.
+- Fix probe_origins() trusting a probe cache file in cache_dir that
+  holds valid JSON but not a list of strings. A number or a nested list
+  raised TypeError, and so did every request when autoprobe is on. Such
+  a file is now ignored and the origins are probed again.
 - Fix get_message_by_msgid() and validate() raising RemoteError instead
   of OperationCancelledError when cancel_active() or shutdown() stops
   them mid-request. Code that catches RemoteError no longer mistakes a

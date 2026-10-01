@@ -1168,9 +1168,17 @@ class LoreNode:
             return None
         with open(path, 'rb') as f:
             try:
-                origins: list[str] = json.loads(f.read())
+                data: object = json.loads(f.read())
             except (json.JSONDecodeError, ValueError):
                 return None
+        # A corrupt cache must not break the node: it must hold a list of strings.
+        if not isinstance(data, list):
+            return None
+        origins: list[str] = []
+        for origin in cast('list[object]', data):
+            if not isinstance(origin, str):
+                return None
+            origins.append(origin)
         # Validate: must contain exactly the same origins we know about
         if set(origins) != set(self._all_origins):
             return None
