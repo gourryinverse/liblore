@@ -44,6 +44,10 @@ v0.10.0 (unreleased)
   exception. A redirect found on a fallback origin no longer produces a
   broken mbox URL. A 200 without a redirect now fetches the mbox
   instead of returning an empty thread.
+- Fix two processes writing the same cache file at the same time: they
+  shared one temporary file, so one write could fail or leave a broken
+  file. Each write now uses its own temporary file. clear_cache() also
+  removes temporary files left by a process that was killed.
 
 v0.9.0 (2026-08-12)
 -------------------

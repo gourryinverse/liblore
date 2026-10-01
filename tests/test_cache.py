@@ -5,12 +5,17 @@ from __future__ import annotations
 
 import gzip
 import os
+import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 import responses
 
 from liblore import LoreNode, RemoteError
+from liblore.node import _ORPHAN_TMP_AGE, _write_atomic
+
+DISK_FULL = OSError('disk full')
 
 
 class TestCacheReadWrite:
@@ -82,6 +87,65 @@ class TestCacheReadWrite:
         assert os.path.isdir(cache_dir)
 
 
+class TestWriteAtomic:
+    def test_writes(self, tmp_path: Path) -> None:
+        path = tmp_path / 'x.lore.cache'
+        _write_atomic(str(path), b'data')
+        assert path.read_bytes() == b'data'
+        assert os.listdir(tmp_path) == ['x.lore.cache']
+
+    def test_two_writers_of_one_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A second process writes the file while the first is writing it."""
+        path = str(tmp_path / 'x.lore.cache')
+        real_replace = os.replace
+        calls = 0
+
+        def replace(src: str, dst: str) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                _write_atomic(path, b'second')
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, 'replace', replace)
+        # With a shared temporary name, the second writer would find
+        # the first one's file, and one of the two writes would fail.
+        _write_atomic(path, b'first')
+        assert calls == 2
+        # The last one to finish wins, and nothing is left behind.
+        assert Path(path).read_bytes() == b'first'
+        assert os.listdir(tmp_path) == ['x.lore.cache']
+
+    @pytest.mark.skipif(os.name != 'posix', reason='POSIX file modes')
+    def test_mode_follows_umask(self, tmp_path: Path) -> None:
+        """Like open(), not like mkstemp(), which always gives 0o600."""
+        path = tmp_path / 'x.lore.cache'
+        old = os.umask(0o022)
+        try:
+            _write_atomic(str(path), b'data')
+        finally:
+            os.umask(old)
+        assert path.stat().st_mode & 0o777 == 0o644
+
+    def test_failure_removes_temporary_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(os, 'replace', mock.Mock(side_effect=DISK_FULL))
+        with pytest.raises(OSError, match='disk full'):
+            _write_atomic(str(tmp_path / 'x.lore.cache'), b'data')
+        assert os.listdir(tmp_path) == []
+
+    def test_cache_write_failure_is_only_logged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(os, 'replace', mock.Mock(side_effect=DISK_FULL))
+        node = LoreNode(cache_dir=str(tmp_path))
+        node._cache_write(node._cache_key('a', '1'), b'data')
+        assert os.listdir(tmp_path) == []
+
+
 class TestClearCache:
     def test_clears_cache_files(self, tmp_path: Path) -> None:
         node = LoreNode(cache_dir=str(tmp_path))
@@ -101,6 +165,29 @@ class TestClearCache:
     def test_noop_when_disabled(self) -> None:
         node = LoreNode()
         node.clear_cache()  # Should not raise
+
+    def test_removes_orphaned_temporary_files(self, tmp_path: Path) -> None:
+        """Left by a killed process: nothing else would ever remove them."""
+        orphans = [
+            'a.lore.cache.0123456789abcdef.tmp',
+            # The name that versions before 0.10 used.
+            'c.lore.cache.tmp',
+        ]
+        kept = ['other.tmp', 'e.lore.cache.notours.tmp']
+        for name in orphans + kept:
+            (tmp_path / name).write_bytes(b'x')
+        old = time.time() - _ORPHAN_TMP_AGE - 1
+        for name in orphans:
+            os.utime(tmp_path / name, (old, old))
+        LoreNode(cache_dir=str(tmp_path)).clear_cache()
+        assert sorted(os.listdir(tmp_path)) == sorted(kept)
+
+    def test_keeps_temporary_files_in_use(self, tmp_path: Path) -> None:
+        """Another process may be writing it right now."""
+        fresh = tmp_path / 'a.lore.cache.0123456789abcdef.tmp'
+        fresh.write_bytes(b'x')
+        LoreNode(cache_dir=str(tmp_path)).clear_cache()
+        assert os.listdir(tmp_path) == [fresh.name]
 
 
 class TestProperties:

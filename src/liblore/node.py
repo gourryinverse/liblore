@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -207,6 +208,50 @@ def _operation_scope(func: Callable[_P, _R]) -> Callable[_P, _R]:
             return func(*args, **kwargs)
 
     return wrapper
+
+
+# A temporary file _write_atomic() left behind when its process was
+# killed.  Versions before 0.10 named it <file>.tmp.
+_ORPHAN_TMP_RE = re.compile(r'.+\.lore\.cache(?:\.[0-9a-f]{16})?\.tmp')
+# A temporary file younger than this may still be in use by a running
+# process, so clear_cache() leaves it alone.
+_ORPHAN_TMP_AGE = 3600
+
+
+def _write_atomic(path: str, data: bytes) -> None:
+    """Write *data* to *path* so that readers see the old or the new file.
+
+    The data goes to a temporary file next to *path*, which then
+    replaces it.  The temporary name is unique, so processes that write
+    the same file at the same time don't write into each other's file.
+    Unlike :func:`tempfile.mkstemp`, the file gets the same mode as
+    :func:`open` would give it (``0o666`` minus the umask).
+
+    Raises :class:`OSError`; the temporary file is removed first.
+    """
+    tmp_path = f'{path}.{secrets.token_hex(8)}.tmp'
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    try:
+        with os.fdopen(fd, 'wb') as f:
+            f.write(data)
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _orphan_tmp(dirname: str, entry: str, now: float) -> bool:
+    """Whether *entry* in *dirname* is a stale temporary file of ours."""
+    if not _ORPHAN_TMP_RE.fullmatch(entry):
+        return False
+    try:
+        mtime = os.stat(os.path.join(dirname, entry)).st_mtime
+    except OSError:
+        return False
+    return now - mtime > _ORPHAN_TMP_AGE
 
 
 class LoreNode:
@@ -689,17 +734,10 @@ class LoreNode:
             return
         key = self._probe_cache_key()
         path = os.path.join(self._cache_dir, f'{key}.lore.cache')
-        tmp_path = path + '.tmp'
         try:
-            with open(tmp_path, 'wb') as f:
-                f.write(json.dumps(origins).encode())
-            os.replace(tmp_path, path)
+            _write_atomic(path, json.dumps(origins).encode())
         except OSError:
             logger.debug('Failed to write probe cache: %s', path)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
     def _probe_one(self, origin: str) -> tuple[str, float]:
         """HEAD manifest.js.gz on *origin*, return (origin, elapsed).
@@ -912,24 +950,24 @@ class LoreNode:
         if self._cache_dir is None:
             return
         path = os.path.join(self._cache_dir, f'{key}.lore.cache')
-        tmp_path = path + '.tmp'
         try:
-            with open(tmp_path, 'wb') as f:
-                f.write(data)
-            os.replace(tmp_path, path)
+            _write_atomic(path, data)
         except OSError:
             logger.debug('Failed to write cache file: %s', path)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
 
     def clear_cache(self) -> None:
-        """Remove all cache files from *cache_dir*."""
+        """Remove all cache files from *cache_dir*.
+
+        Temporary files left by a killed process are removed too, once
+        they are old enough that no running write can still own them.
+        """
         if self._cache_dir is None:
             return
+        now = time.time()
         for entry in os.listdir(self._cache_dir):
-            if entry.endswith('.lore.cache'):
+            if entry.endswith('.lore.cache') or _orphan_tmp(
+                self._cache_dir, entry, now
+            ):
                 try:
                     os.unlink(os.path.join(self._cache_dir, entry))
                 except OSError:
