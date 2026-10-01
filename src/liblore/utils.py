@@ -16,7 +16,7 @@ import textwrap
 import urllib.parse
 from collections.abc import Sequence
 from email.message import EmailMessage
-from typing import NamedTuple
+from typing import NamedTuple, cast
 
 from liblore import emlpolicy
 
@@ -125,8 +125,7 @@ def get_clean_msgid(msg: EmailMessage, header: str = 'Message-Id') -> str | None
         if value:
             matches = _MSGID_RE.search(str(value))
             if matches:
-                msgid: str = matches.group(1)
-                return msgid
+                return cast('str', matches.group(1))
     return None
 
 
@@ -983,8 +982,7 @@ def _clean_msgid_raw(raw: bytes, header: str = 'message-id') -> str | None:
     if val:
         match = _MSGID_RE.search(val)
         if match:
-            msgid: str = match.group(1)
-            return msgid
+            return cast('str', match.group(1))
     return None
 
 

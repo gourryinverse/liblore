@@ -230,6 +230,20 @@ def _warn_outage_once(kind: str, url: str, msg: str, *args: object) -> None:
 _SOURCE_RANK = {Source.LOCAL: 0, Source.UPSTREAM: 1, Source.DEGRADED: 2}
 
 
+class _OpState(threading.local):
+    """Per-thread state of the operation in flight (see :meth:`LoreNode._operation`).
+
+    The class attributes are the defaults every thread starts with.
+    """
+
+    depth: int = 0
+    generation: int | None = None
+    source: Source = Source.LOCAL
+    as_of: float | None = None
+    last_source: Source | None = None
+    last_as_of: float | None = None
+
+
 def _unreachable(ex: RemoteError) -> bool:
     """Whether *ex* means the server gave no usable answer.
 
@@ -492,7 +506,7 @@ class LoreNode:
         self._cancel_lock = threading.Lock()
         self._cancel_generation = 0
         self._shutdown_event = threading.Event()
-        self._op_local = threading.local()
+        self._op_local = _OpState()
         self._user_agent_plus: str | None = None
         self._user_agent: str = f'liblore/{__import__("liblore").__version__}'
         self._cache_dir = cache_dir
@@ -919,7 +933,7 @@ class LoreNode:
         from and how far they reach, and publishes the result as
         :attr:`last_source` and :attr:`last_as_of` when it succeeds.
         """
-        depth = getattr(self._op_local, 'depth', 0)
+        depth = self._op_local.depth
         if depth == 0:
             self._op_local.last_source = None
             self._op_local.last_as_of = None
@@ -929,22 +943,20 @@ class LoreNode:
             self._op_local.source = Source.LOCAL
             self._op_local.as_of = None
         self._op_local.depth = depth + 1
-        succeeded = False
         try:
             yield
-            succeeded = True
         finally:
             self._op_local.depth = depth
             if depth == 0:
                 self._op_local.generation = None
-                if succeeded:
-                    self._op_local.last_source = self._op_local.source
-                    self._op_local.last_as_of = self._op_local.as_of
+        # Only reached when the operation succeeded.
+        if depth == 0:
+            self._op_local.last_source = self._op_local.source
+            self._op_local.last_as_of = self._op_local.as_of
 
     def _record_source(self, source: Source) -> None:
         """Note that the current operation got an answer from *source*."""
-        current: Source = getattr(self._op_local, 'source', Source.LOCAL)
-        if _SOURCE_RANK[source] > _SOURCE_RANK[current]:
+        if _SOURCE_RANK[source] > _SOURCE_RANK[self._op_local.source]:
             self._op_local.source = source
 
     def _record_as_of(self, as_of: float | None) -> None:
@@ -954,20 +966,19 @@ class LoreNode:
         """
         if as_of is None:
             return
-        current: float | None = getattr(self._op_local, 'as_of', None)
+        current = self._op_local.as_of
         if current is None or as_of < current:
             self._op_local.as_of = as_of
 
     def _last_as_of(self) -> float | None:
         """:attr:`last_as_of` as a Unix time."""
-        as_of: float | None = getattr(self._op_local, 'last_as_of', None)
-        return as_of
+        return self._op_local.last_as_of
 
     def _cancelled(self) -> bool:
         """Whether the current thread's operation has been cancelled."""
         if self._shutdown_event.is_set():
             return True
-        generation: int | None = getattr(self._op_local, 'generation', None)
+        generation = self._op_local.generation
         if generation is None:
             return False
         return generation != self._cancel_generation
@@ -1071,8 +1082,7 @@ class LoreNode:
         On a node that is not a partial mirror, every answer is
         :attr:`~liblore.Source.LOCAL`.
         """
-        source: Source | None = getattr(self._op_local, 'last_source', None)
-        return source
+        return self._op_local.last_source
 
     @property
     def last_as_of(self) -> datetime | None:
@@ -1800,10 +1810,10 @@ class LoreNode:
             request_url = self._rewrite_url(url, origin)
             logger.debug('Trying %s %s', method, request_url)
             try:
-                resp: requests.Response = getattr(
-                    session,
-                    method.lower(),
-                )(request_url, **kwargs)
+                resp = cast(
+                    'requests.Response',
+                    getattr(session, method.lower())(request_url, **kwargs),
+                )
             except (requests.ConnectionError, requests.Timeout) as exc:
                 # cancel_active() and shutdown() close the session
                 # mid-flight, which surfaces here as a ConnectionError.
@@ -2417,7 +2427,7 @@ class LoreNode:
 
         try:
             response.raise_for_status()
-            data: bytes = response.content
+            data = cast('bytes', response.content)
         except Exception as ex:
             raise failed(ex) from ex
 
