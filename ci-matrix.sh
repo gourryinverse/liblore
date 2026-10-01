@@ -12,8 +12,12 @@ set -eu
 # cache (python-build-standalone), so no system packages or sudo are needed.
 #
 # Override the version list: PYTHONS="3.9 3.14" ./ci-matrix.sh
+#
+# The newest version may be a pre-release, so that it is tested before it
+# ships. uv keeps using an installed pre-release until it is upgraded: run
+# `uv python install --upgrade 3.15` once the final release is out.
 
-PYTHONS="${PYTHONS:-3.9 3.10 3.11 3.12 3.13 3.14}"
+PYTHONS="${PYTHONS:-3.9 3.10 3.11 3.12 3.13 3.14 3.15}"
 
 # Install any requested interpreters that are missing. This is an explicit
 # step because a dev may have set UV_PYTHON_DOWNLOADS=manual globally to
