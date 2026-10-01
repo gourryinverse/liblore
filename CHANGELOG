@@ -26,6 +26,10 @@ v0.10.0 (unreleased)
   are removed now. parse_patch_subject() uses the same rule, and both
   also know Wg:, Tr:, Odp: and Ref:. Add strip_reply_prefixes() for
   doing this on a subject line on its own.
+- Fix get_clean_msgid() returning None, or a cut-off ID, for a
+  Message-ID with "(" or a stray '"' in it, such as <x$(id)@x>. The
+  header parser treats these as the start of a comment or a quoted
+  string. The ID now comes from the header as it was written.
 - Fix msg_get_payload() raising LookupError on a message whose declared
   charset has no codec (charset="yes" is posted in the wild).
   errors='replace' does not cover it, because the codec name is what

@@ -47,6 +47,9 @@ _RE_REPLY = re.compile(
 # A subsystem prefix is never followed by a bracket, so this is safe.
 _RE_REPLY_FOREIGN = re.compile(r'^\w{2,3}:\s*\[')
 
+# The contents of the first <...> pair in a msg-id header.
+_MSGID_RE = re.compile(r'<([^>]+)>')
+
 
 # =====================================================================
 # Header and message-ID utilities
@@ -103,15 +106,27 @@ def get_clean_msgid(msg: EmailMessage, header: str = 'Message-Id') -> str | None
     address-parsing path would mangle a bare message-ID when the header
     also carries an encoded-word comment (e.g. Gnus-style In-Reply-To).
 
+    "Raw" means the value as it appeared in the source message, taken
+    from :meth:`~email.message.Message.raw_items`.  The parsed value
+    from ``msg.get()`` is not good enough: the policy's Message-ID
+    parser reads ``(`` as the start of a comment and stops at a stray
+    ``"``, so ``<x$(id)@x>`` comes back as ``<x$``.  Real Message-IDs
+    contain such characters, and public-inbox indexes them verbatim.
+
+    Only when the raw value has no ``<...>`` do we fall back to the
+    parsed value, which decodes a (nonconformant) RFC 2047-encoded ID.
+
     This mirrors :func:`_clean_msgid_raw`, which does the same on raw
     message bytes.
     """
-    raw = msg.get(header)
-    if raw:
-        matches = re.search(r'<([^>]+)>', str(raw))
-        if matches:
-            msgid: str = matches.group(1)
-            return msgid
+    wanted = header.lower()
+    raw = next((str(v) for n, v in msg.raw_items() if n.lower() == wanted), None)
+    for value in (raw, msg.get(header)):
+        if value:
+            matches = _MSGID_RE.search(str(value))
+            if matches:
+                msgid: str = matches.group(1)
+                return msgid
     return None
 
 
@@ -966,7 +981,7 @@ def _clean_msgid_raw(raw: bytes, header: str = 'message-id') -> str | None:
     """Extract a clean message ID (without angle brackets) from raw bytes."""
     val = _get_raw_header(raw, header)
     if val:
-        match = re.search(r'<([^>]+)>', val)
+        match = _MSGID_RE.search(val)
         if match:
             msgid: str = match.group(1)
             return msgid

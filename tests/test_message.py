@@ -5,9 +5,10 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 
+import pytest
 from conftest import MsgFactory
 
-from liblore.utils import clean_header, get_clean_msgid, parse_message
+from liblore.utils import _clean_msgid_raw, clean_header, get_clean_msgid, parse_message
 
 
 class TestCleanHeader:
@@ -132,6 +133,67 @@ class TestGetCleanMsgid:
         )
         msg = parse_message(raw)
         assert get_clean_msgid(msg) == 'foo@bar'
+
+    # --- Characters the header parser chokes on -------------------------
+    # The policy's Message-ID parser reads "(" as a comment and stops at a
+    # stray quote, so these must come from the raw source value instead.
+
+    @pytest.mark.parametrize(
+        'msgid',
+        [
+            'x$(id)@x',
+            'a(b)c@x',
+            'a"b@x',
+            '"quoted local"@x',
+            'a/b?c@x',
+        ],
+    )
+    def test_parser_unfriendly_characters(self, msgid: str) -> None:
+        raw = f'From: x@example.com\r\nMessage-ID: <{msgid}>\r\n\r\nbody\r\n'
+        msg = parse_message(raw.encode())
+        assert get_clean_msgid(msg) == msgid
+
+    def test_message_id_matches_in_reply_to(self) -> None:
+        """A reply must point at the exact ID its parent reports."""
+        raw = (
+            b'From: x@example.com\r\n'
+            b'Message-ID: <x$(id)@x>\r\n'
+            b'In-Reply-To: <x$(id)@x>\r\n'
+            b'\r\nbody\r\n'
+        )
+        msg = parse_message(raw)
+        assert get_clean_msgid(msg) == get_clean_msgid(msg, 'In-Reply-To')
+        assert get_clean_msgid(msg) == _clean_msgid_raw(raw)
+
+    def test_header_name_is_case_insensitive(self) -> None:
+        raw = b'From: x@example.com\r\nmessage-id: <a(b)c@x>\r\n\r\nbody\r\n'
+        msg = parse_message(raw)
+        assert get_clean_msgid(msg, 'Message-Id') == 'a(b)c@x'
+
+    def test_first_header_wins(self) -> None:
+        raw = (
+            b'From: x@example.com\r\n'
+            b'Message-ID: <first(1)@x>\r\n'
+            b'Message-ID: <second@x>\r\n'
+            b'\r\nbody\r\n'
+        )
+        msg = parse_message(raw)
+        assert get_clean_msgid(msg) == 'first(1)@x'
+
+    def test_folded_header(self) -> None:
+        raw = b'From: x@example.com\r\nMessage-ID:\r\n <a(b)c@x>\r\n\r\nbody\r\n'
+        msg = parse_message(raw)
+        assert get_clean_msgid(msg) == 'a(b)c@x'
+
+    def test_list_id(self) -> None:
+        """List-Id is read the same way when picking among duplicates."""
+        raw = (
+            b'From: x@example.com\r\n'
+            b'List-Id: Kernel list <linux-kernel.vger.kernel.org>\r\n'
+            b'\r\nbody\r\n'
+        )
+        msg = parse_message(raw)
+        assert get_clean_msgid(msg, 'List-Id') == 'linux-kernel.vger.kernel.org'
 
 
 class TestParseMessage:
