@@ -901,6 +901,54 @@ class TestFallback:
             # 404 from the same fallback.
             assert len(rsps.calls) == 2
 
+    # public-inbox answers 501 ("search is not available") when an
+    # inbox has no search index, as a mirror made with git clone may
+    # not.  A 5xx moves on to the next origin, so the search reaches one
+    # that can answer it.
+
+    def test_search_without_index_fails_over(self, sample_mbox: bytes) -> None:
+        with responses.RequestsMock() as rsps:
+            node = LoreNode(
+                'https://lore.kernel.org/all',
+                fallback_urls=['http://mirror.local'],
+            )
+            rsps.add(
+                responses.POST,
+                'http://mirror.local/all/?x=m&q=test',
+                status=501,
+            )
+            rsps.add(
+                responses.POST,
+                'https://lore.kernel.org/all/?x=m&q=test',
+                body=gzip.compress(sample_mbox),
+                status=200,
+            )
+
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert request_url(rsps, 0).startswith('http://mirror.local/')
+            assert request_url(rsps, 1).startswith('https://lore.kernel.org/')
+
+    def test_thread_search_without_index_fails_over(self, sample_mbox: bytes) -> None:
+        # Not an empty answer: "nothing new" would hide the replies.
+        with responses.RequestsMock() as rsps:
+            node = LoreNode(
+                'https://lore.kernel.org/all',
+                fallback_urls=['http://mirror.local'],
+            )
+            path = '/all/first%40example.com/?x=m&q=rt%3A1705320000..'
+            rsps.add(responses.POST, 'http://mirror.local' + path, status=501)
+            rsps.add(
+                responses.POST,
+                'https://lore.kernel.org' + path,
+                body=gzip.compress(sample_mbox),
+                status=200,
+            )
+
+            since = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+            msgs = node.get_thread_updates_since('first@example.com', since)
+            assert len(msgs) >= 1
+            assert len(rsps.calls) == 2
+
     def test_head_redirect_fails_over(self, sample_mbox: bytes) -> None:
         """The redirect lookup fails over like any other request."""
         with responses.RequestsMock() as rsps:
