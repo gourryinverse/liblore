@@ -33,6 +33,20 @@ _FROM_RE = re.compile(
 # that needs one level of ">" stripped.  Mirrors git's is_gtfrom().
 _GTFROM_RE = re.compile(rb'^>+From ')
 
+# Leading reply and forward markers in the languages mail clients
+# commonly use, including the counted "Re[2]:" form.  Only real
+# markers: two or three letters and a colon is not enough, because
+# "mm:" and "net:" are kernel subsystems.
+_RE_REPLY = re.compile(
+    r'^\s*(?:(?:re|aw|fwd?|sv|vs|antw|wg|tr|odp|ref)\s*(?:\[\d+])?\s*:\s*)+',
+    re.IGNORECASE,
+)
+
+# b4's catch-all for a reply marker in a language we do not know: two or
+# three letters and a colon, directly in front of a [bracketed] prefix.
+# A subsystem prefix is never followed by a bracket, so this is safe.
+_RE_REPLY_FOREIGN = re.compile(r'^\w{2,3}:\s*\[')
+
 
 # =====================================================================
 # Header and message-ID utilities
@@ -114,19 +128,44 @@ def parse_message(raw: bytes) -> EmailMessage:
 # =====================================================================
 
 
+def strip_reply_prefixes(subject: str) -> tuple[str, bool]:
+    """Remove leading reply markers from *subject*.
+
+    Returns the rest of the subject and whether it was a reply.  The
+    markers are ``Re:``, ``Fwd:`` and their forms in other languages
+    (``Aw:``, ``Sv:``, ``Antw:``, ``Odp:`` and so on), also counted
+    (``Re[2]:``).  Two or three letters and a colon right before a
+    ``[bracketed]`` prefix count too, as in b4, so a reply marker in
+    another language is still removed from a patch subject.
+
+    A subsystem prefix such as ``mm:`` or ``net:`` is kept::
+
+        >>> strip_reply_prefixes('Re: mm: fix the widget')
+        ('mm: fix the widget', True)
+        >>> strip_reply_prefixes('net: fix the socket')
+        ('net: fix the socket', False)
+    """
+    rest, count = _RE_REPLY.subn('', subject)
+    if count:
+        return rest, True
+    if _RE_REPLY_FOREIGN.match(rest):
+        return _RE_REPLY_FOREIGN.sub('[', rest, count=1), True
+    return rest, False
+
+
 def msg_get_subject(msg: EmailMessage, strip_prefixes: bool = False) -> str:
     """Return the decoded Subject header.
 
     When *strip_prefixes* is ``True``, any leading ``[bracketed]``
-    prefixes (e.g. ``[PATCH v3 2/5]``, ``[RFC]``) and ``Re:``/``Aw:``
-    tags are removed, leaving just the bare subject text.
+    prefixes (e.g. ``[PATCH v3 2/5]``, ``[RFC]``) and reply markers
+    (see :func:`strip_reply_prefixes`) are removed, leaving just the
+    bare subject text.  A subsystem prefix such as ``mm:`` is kept.
     """
     raw = msg.get('Subject', '')
     subject = clean_header(raw)
     if not strip_prefixes:
         return subject
-    # Strip Re:/Aw:/Fwd: prefixes
-    subject = re.sub(r'^(\w{2,3}:\s*)+', '', subject)
+    subject, _ = strip_reply_prefixes(subject)
     # Strip all leading [bracketed] prefixes
     subject = re.sub(r'^(\s*\[[^]]*]\s*)+', '', subject)
     return subject.strip()

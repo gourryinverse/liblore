@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from email.message import EmailMessage
 
+import pytest
 from conftest import MsgFactory
 
 from liblore import emlpolicy
@@ -14,6 +15,7 @@ from liblore.utils import (
     msg_get_recipients,
     msg_get_subject,
     sort_msgs_by_received,
+    strip_reply_prefixes,
 )
 
 
@@ -50,6 +52,48 @@ class TestMsgGetSubject:
     def test_strip_no_brackets(self, make_msg: MsgFactory) -> None:
         msg = make_msg(subject='No brackets here')
         assert msg_get_subject(msg, strip_prefixes=True) == 'No brackets here'
+
+    @pytest.mark.parametrize(
+        ('subject', 'bare'),
+        [
+            # A subsystem prefix looks like a short reply marker, but
+            # it is part of the subject.
+            ('Re: mm: fix the widget', 'mm: fix the widget'),
+            ('net: fix the socket', 'net: fix the socket'),
+            ('bpf: x', 'bpf: x'),
+            ('Re: [PATCH] mm: x', 'mm: x'),
+            # Reply and forward markers, stacked and in other languages.
+            ('Fwd: Re: [PATCH] x', 'x'),
+            ('AW: x', 'x'),
+            ('RE[2]: Odp: x', 'x'),
+            ('Sv: Vs: WG: TR: x', 'x'),
+            # An unknown marker is removed only in front of a bracket.
+            ('Отв: [PATCH v2] x', 'x'),
+        ],
+    )
+    def test_strip_keeps_subsystem(
+        self, make_msg: MsgFactory, subject: str, bare: str
+    ) -> None:
+        msg = make_msg(subject=subject)
+        assert msg_get_subject(msg, strip_prefixes=True) == bare
+
+
+class TestStripReplyPrefixes:
+    def test_reply(self) -> None:
+        assert strip_reply_prefixes('Re: mm: x') == ('mm: x', True)
+
+    def test_not_a_reply(self) -> None:
+        assert strip_reply_prefixes('mm: x') == ('mm: x', False)
+
+    def test_counted_marker(self) -> None:
+        assert strip_reply_prefixes('Re[3]: x') == ('x', True)
+
+    def test_unknown_marker_keeps_the_bracket(self) -> None:
+        assert strip_reply_prefixes('Отв: [PATCH] x') == ('[PATCH] x', True)
+
+    def test_unknown_marker_without_bracket_is_kept(self) -> None:
+        # It might be a subsystem; there is no way to tell, so keep it.
+        assert strip_reply_prefixes('xyz: x') == ('xyz: x', False)
 
 
 class TestMsgGetAuthor:

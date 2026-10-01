@@ -121,10 +121,20 @@ class TestParsePatchSubject:
     def test_foreign_reply_marker(self) -> None:
         # A reply marker in a language we do not know, sitting directly in
         # front of the bracket group.
-        parsed = parse_patch_subject('Odp: [PATCH 1/2] usb: fix the thing')
+        parsed = parse_patch_subject('Отв: [PATCH 1/2] usb: fix the thing')
         assert parsed.is_reply is True
         assert parsed.is_patch is True
         assert parsed.counter == 1
+
+    def test_subsystem_is_not_a_reply_marker(self) -> None:
+        # "mm:" looks like a two-letter reply marker, but it is the
+        # subsystem; with no bracket after it, it stays in the subject.
+        parsed = parse_patch_subject('mm: fix the widget')
+        assert parsed.is_reply is False
+        assert parsed.title == 'mm: fix the widget'
+        parsed = parse_patch_subject('Re: net: fix the socket')
+        assert parsed.is_reply is True
+        assert parsed.title == 'net: fix the socket'
 
     def test_oversized_counter_is_not_a_counter(self) -> None:
         # Bounded to four digits, so a date cannot pose as "n/m".

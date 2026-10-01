@@ -48,6 +48,7 @@ from liblore.utils import (
     msg_get_payload,
     msg_get_subject,
     split_body_parts,
+    strip_reply_prefixes,
 )
 
 # Version of the serialised shape produced by to_dict().  Consumers that
@@ -56,16 +57,6 @@ from liblore.utils import (
 # Adding a key is not a bump; every key is always present, so a reader
 # that does not know a new one can ignore it.
 SCHEMA_VERSION = 1
-
-# Leading Re:/Aw:/Fwd: style reply markers, including the "Re[2]:" form.
-_RE_REPLY = re.compile(
-    r'^\s*(?:(?:re|aw|fwd|fw|sv|vs|antw)\s*(?:\[\d+])?\s*:\s*)+',
-    re.IGNORECASE,
-)
-
-# b4's catch-all for a reply marker in a language we do not know: two or
-# three letters and a colon, directly in front of the bracket group.
-_RE_REPLY_FOREIGN = re.compile(r'^\w{2,3}:\s*\[')
 
 # One leading [bracketed] prefix group.
 _RE_BRACKET = re.compile(r'^\s*\[([^]]*)]\s*')
@@ -621,13 +612,7 @@ def parse_patch_subject(subject: str) -> PatchSubject:
     """
     remainder = re.sub(r'\s+', ' ', clean_header(subject)).strip()
 
-    remainder, count = _RE_REPLY.subn('', remainder)
-    is_reply = count > 0
-    if not is_reply and _RE_REPLY_FOREIGN.match(remainder):
-        # A reply marker in some language we do not recognise; keep the
-        # bracket group it was sitting in front of.
-        remainder = _RE_REPLY_FOREIGN.sub('[', remainder, count=1)
-        is_reply = True
+    remainder, is_reply = strip_reply_prefixes(remainder)
 
     version = 1
     counter = 1

@@ -20,6 +20,12 @@ v0.10.0 (unreleased)
 - Prefer X-Original-From in msg_get_author(), so a message rewritten by
   a mailing list reports the sender rather than the list. The header is
   not authenticated; code that needs proof wants b4's attestation.
+- Fix msg_get_subject(strip_prefixes=True) removing a subsystem prefix
+  such as "mm:" or "net:" when the subject has no [bracketed] prefix,
+  as in "Re: mm: fix the widget". Only real reply and forward markers
+  are removed now. parse_patch_subject() uses the same rule, and both
+  also know Wg:, Tr:, Odp: and Ref:. Add strip_reply_prefixes() for
+  doing this on a subject line on its own.
 - Fix msg_get_payload() raising LookupError on a message whose declared
   charset has no codec (charset="yes" is posted in the wild).
   errors='replace' does not cover it, because the codec name is what

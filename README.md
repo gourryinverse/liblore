@@ -863,13 +863,19 @@ from liblore.utils import (
     msg_get_inbody_author,
     msg_get_payload,
     msg_get_recipients,
+    strip_reply_prefixes,
 )
 
 # Get the decoded subject line
 subject = msg_get_subject(msg)
 
-# Strip [PATCH v3 2/5] and Re: prefixes to get the bare subject
+# Strip [PATCH v3 2/5] and Re: prefixes to get the bare subject.
+# A subsystem prefix such as "mm:" is part of the subject and stays.
 bare = msg_get_subject(msg, strip_prefixes=True)
+
+# Or remove only the reply markers from a subject line you already have
+rest, is_reply = strip_reply_prefixes('Re: mm: fix the widget')
+# -> ('mm: fix the widget', True)
 
 # Get the author as a (name, email) tuple
 name, addr = msg_get_author(msg)
