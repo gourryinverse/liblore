@@ -9,7 +9,7 @@ import email.policy
 import enum
 from email.message import EmailMessage
 
-__version__ = '0.9.0'
+__version__ = '0.10.0'
 
 # Email policy used for parsing and serialising messages
 emlpolicy = email.policy.EmailPolicy(
