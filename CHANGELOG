@@ -1,6 +1,6 @@
 CHANGELOG
 ==
-v0.10.1 (unreleased)
+v0.10.1 (2026-10-04)
 --------------------
 - Add a local_sufficient argument to get_mbox_by_query(),
   get_thread_by_query() and batch_get_thread_by_query(). It tells a
