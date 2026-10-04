@@ -2682,3 +2682,119 @@ class TestFreshness(PartialNode):
             thread.join()
         assert seen == [UPDATED + 100]
         assert as_of_of(node) == UPDATED
+
+
+class TestLocalSufficient(PartialNode):
+    """get_mbox_by_query(local_sufficient=True): the local result is final."""
+
+    def test_hit_stays_local(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            assert node.get_mbox_by_query('test', local_sufficient=True) == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+        assert source_of(node) is Source.LOCAL
+        assert cached(node, 'mbox_by_query', 'test', 'False')
+
+    def test_404_is_final(self, tmp_path: Path) -> None:
+        # The same answer a full node gives for "no results".
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, status=404, headers=PARTIAL)
+            with pytest.raises(RemoteError) as exc:
+                node.get_mbox_by_query('test', local_sufficient=True)
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+        assert exc.value.status_code == 404
+        assert not isinstance(exc.value, NotOnMirrorError)
+
+    def test_empty_is_final(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b''), headers=PARTIAL)
+            assert node.get_mbox_by_query('test', local_sufficient=True) == b''
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+        assert source_of(node) is Source.LOCAL
+
+    def test_empty_is_not_cached(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        # A later call without local_sufficient must still ask the upstream
+        # archive, and not find the sufficient empty answer in the cache.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b''), headers=PARTIAL)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            node.get_mbox_by_query('test', local_sufficient=True)
+            assert not cached(node, 'mbox_by_query', 'test', 'False')
+            assert node.get_mbox_by_query('test') == sample_mbox
+            assert urls(rsps) == [
+                ('POST', LOCAL_QUERY),
+                ('POST', LOCAL_QUERY),
+                ('POST', UP_QUERY),
+            ]
+
+    def test_upstream_first_is_ignored(
+        self, tmp_path: Path, sample_mbox: bytes
+    ) -> None:
+        node = self.node(tmp_path, partial_search='upstream')
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox), headers=PARTIAL)
+            assert node.get_mbox_by_query('test', local_sufficient=True) == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+        assert source_of(node) is Source.LOCAL
+        # Upstream-first never caches the mirror's answer: a later
+        # call without local_sufficient must not get it from the cache.
+        assert not cached(node, 'mbox_by_query', 'test', 'False')
+
+    def test_learned_from_same_answer(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, status=404, headers=PARTIAL)
+            with pytest.raises(RemoteError):
+                node.get_mbox_by_query('test', local_sufficient=True)
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+        assert node.upstream_url == UPSTREAM
+
+    @DOWN
+    def test_mirror_down_uses_upstream(
+        self, tmp_path: Path, sample_mbox: bytes, status: int | None
+    ) -> None:
+        # A sufficient local result needs the mirror to answer at all.
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            add_down(rsps, responses.POST, LOCAL_QUERY, status)
+            rsps.add(responses.POST, UP_QUERY, body=gz(sample_mbox))
+            assert node.get_mbox_by_query('test', local_sufficient=True) == sample_mbox
+            assert urls(rsps) == [('POST', LOCAL_QUERY), ('POST', UP_QUERY)]
+        assert source_of(node) is Source.UPSTREAM
+
+    def test_bad_upstream_config_is_not_read(self, tmp_path: Path) -> None:
+        # No fallback means no upstream node, so its git config can't fail.
+        node = self.node(tmp_path)
+        with (
+            patch.object(LoreNode, 'from_git_config', side_effect=LibloreError('bad')),
+            responses.RequestsMock() as rsps,
+        ):
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b''), headers=PARTIAL)
+            assert node.get_mbox_by_query('test', local_sufficient=True) == b''
+
+    def test_thread_by_query(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, status=404, headers=PARTIAL)
+            with pytest.raises(RemoteError):
+                node.get_thread_by_query('test', local_sufficient=True)
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+
+    def test_batch_thread_by_query(self, tmp_path: Path) -> None:
+        node = self.node(tmp_path)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(b''), headers=PARTIAL)
+            with pytest.raises(LookupError):
+                node.batch_get_thread_by_query(['test'], local_sufficient=True)
+            assert urls(rsps) == [('POST', LOCAL_QUERY)]
+
+    def test_full_node_unchanged(self, tmp_path: Path, sample_mbox: bytes) -> None:
+        node = self.node(tmp_path, learned=False)
+        with responses.RequestsMock() as rsps:
+            rsps.add(responses.POST, LOCAL_QUERY, body=gz(sample_mbox))
+            assert node.get_mbox_by_query('test', local_sufficient=True) == sample_mbox
+        assert cached(node, 'mbox_by_query', 'test', 'False')

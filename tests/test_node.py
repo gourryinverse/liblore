@@ -681,7 +681,7 @@ class TestBatchGetThreadByQuery:
     class _Node(LoreNode):
         def __init__(self, results: list[list[EmailMessage]]) -> None:
             super().__init__()
-            self.calls: list[tuple[str, bool]] = []
+            self.calls: list[tuple[str, bool, bool]] = []
             self._results = results
 
         @override
@@ -690,8 +690,9 @@ class TestBatchGetThreadByQuery:
             query: str,
             *,
             full_threads: bool = False,
+            local_sufficient: bool = False,
         ) -> list[EmailMessage]:
-            self.calls.append((query, full_threads))
+            self.calls.append((query, full_threads, local_sufficient))
             return self._results.pop(0)
 
     def test_returns_ordered_results(self) -> None:
@@ -713,6 +714,15 @@ class TestBatchGetThreadByQuery:
 
         assert results == [result]
         mock_sleep.assert_not_called()
+
+    def test_passes_arguments(self) -> None:
+        node = self._Node([[EmailMessage()], [EmailMessage()]])
+        with patch('liblore.node.time.sleep'):
+            node.batch_get_thread_by_query(
+                ['q1', 'q2'], full_threads=True, local_sufficient=True
+            )
+
+        assert node.calls == [('q1', True, True), ('q2', True, True)]
 
     def test_sleep_count_matches_gaps(self) -> None:
         node = self._Node(

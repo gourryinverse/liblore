@@ -1,5 +1,14 @@
 CHANGELOG
 ==
+v0.10.1 (unreleased)
+--------------------
+- Add a local_sufficient argument to get_mbox_by_query(),
+  get_thread_by_query() and batch_get_thread_by_query(). It tells a
+  partial mirror that its own answer is sufficient for this search,
+  even when it finds nothing, so the upstream archive is not asked.
+  Use it when you already know the mirror has what you search for. When
+  the mirror can't be reached, the upstream archive still answers.
+
 v0.10.0 (2026-10-01)
 --------------------
 - Add support for partial mirrors, such as a maintainer's local mirror

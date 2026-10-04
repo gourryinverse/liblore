@@ -2046,6 +2046,7 @@ class LoreNode:
         *,
         full_threads: bool = False,
         nocache: bool = False,
+        local_sufficient: bool = False,
     ) -> bytes:
         """POST a search query and return the raw mbox bytes.
 
@@ -2058,6 +2059,15 @@ class LoreNode:
         doesn't have is then missed.  With ``partial_search='upstream'``
         the upstream archive is asked first, and the mirror only when
         the upstream archive can't be reached.
+
+        With *local_sufficient*, the mirror's answer is final when the mirror
+        answers, even when it finds nothing: the upstream archive is not
+        asked, and ``partial_search='upstream'`` is ignored.  Use it when
+        you already know the mirror tracks what you search for, for
+        example because it just answered for the thread the search is
+        about.  "No results" is then the server's 404
+        (:class:`~liblore.RemoteError`), as on a full node.  When the
+        mirror can't be reached, the upstream archive still answers.
         """
 
         # A named function, not a lambda: mypy can't infer a lambda
@@ -2078,11 +2088,20 @@ class LoreNode:
             try:
                 t_mbox, as_of = self._local_search(query, full_threads)
             except RemoteError as ex:
+                if local_sufficient:
+                    raise
                 # This answer may be the first to say the node is partial.
                 upstream = self._fallback_node()
                 if upstream is None or ex.status_code != 404:
                     raise
                 raise _Miss(upstream, missing=f'No results for {query!r}') from ex
+            if local_sufficient:
+                # Sufficient for the caller, but the mirror's answer may still
+                # be incomplete: cache only what the default would.
+                partial = self._get_upstream_url() is not None
+                if not (partial and (upstream_first or not t_mbox)):
+                    self._cache_write(key, t_mbox)
+                return t_mbox, as_of
             upstream = self._fallback_node()
             if upstream is not None and (upstream_first or not t_mbox):
                 # The mirror's answer, which may be incomplete: never
@@ -2094,7 +2113,10 @@ class LoreNode:
             return t_mbox, as_of
 
         return self._answer(
-            f'Search {query!r}', local, remote, upstream_first=upstream_first
+            f'Search {query!r}',
+            local,
+            remote,
+            upstream_first=upstream_first and not local_sufficient,
         )
 
     def _local_search(self, query: str, full_threads: bool) -> tuple[bytes, float]:
@@ -2356,13 +2378,17 @@ class LoreNode:
         query: str,
         *,
         full_threads: bool = False,
+        local_sufficient: bool = False,
     ) -> list[EmailMessage]:
         """POST a search query and return deduplicated messages.
 
         When *full_threads* is ``True``, the server expands results to
         include the full thread for every matching message.
+        *local_sufficient* is passed on to :meth:`get_mbox_by_query`.
         """
-        t_mbox = self.get_mbox_by_query(query, full_threads=full_threads)
+        t_mbox = self.get_mbox_by_query(
+            query, full_threads=full_threads, local_sufficient=local_sufficient
+        )
         if not t_mbox:
             raise LookupError(f'No results for query: {query}')
         msgs = split_and_dedupe(t_mbox)
@@ -2473,6 +2499,7 @@ class LoreNode:
         queries: list[str],
         *,
         full_threads: bool = False,
+        local_sufficient: bool = False,
     ) -> list[list[EmailMessage]]:
         """Run multiple queries with rate limiting.
 
@@ -2481,6 +2508,7 @@ class LoreNode:
 
         When *full_threads* is ``True``, the server expands results to
         include the full thread for every matching message.
+        *local_sufficient* is passed on to :meth:`get_mbox_by_query`.
 
         Returns a list of results in the same order as the input.
         :attr:`last_source` then reports the worst source of them all;
@@ -2492,7 +2520,11 @@ class LoreNode:
         for i, query in enumerate(queries):
             if i > 0:
                 time.sleep(0.1)
-            results.append(self.get_thread_by_query(query, full_threads=full_threads))
+            results.append(
+                self.get_thread_by_query(
+                    query, full_threads=full_threads, local_sufficient=local_sufficient
+                )
+            )
         return results
 
     @_operation_scope

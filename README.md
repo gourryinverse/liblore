@@ -230,7 +230,11 @@ the node at the mirror, and it learns the rest.
 - **Searches stay local.** A search the mirror answers is final. The
   upstream archive is asked only when the mirror finds nothing. Set
   `partialsearch = upstream` to ask the upstream archive first, if you want
-  every hit and don't mind the wait.
+  every hit and don't mind the wait. When you already know the mirror has
+  what you are searching for (for example, it just answered for the thread
+  the search is about), pass `local_sufficient=True`: then even "no
+  results" is final, and the upstream archive is asked only if the mirror
+  can't be reached.
 - **Polling stays local.** `get_thread_updates_since()` first asks the
   mirror whether it has the thread (a `HEAD` request). For a thread it has,
   its "nothing new" is final, and lore.kernel.org is not contacted. For a
